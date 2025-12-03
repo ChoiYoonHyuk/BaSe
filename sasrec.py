@@ -4,21 +4,46 @@ import random
 import math
 import sys
 
+import pandas as pd
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
-def load_amazon_beauty(path, min_uc=5, min_ic=5):
+def load_kuairand_pure(
+    path,
+    min_uc=3,
+    min_ic=5,
+    user_col="user_id",
+    item_col="video_id",
+    time_col="time_ms",
+    click_col="is_click",
+):
+    df = pd.read_csv(path)
+
+    if click_col in df.columns:
+        df = df[df[click_col] == 1].copy()
+
+    if time_col not in df.columns:
+        raise ValueError(f"time_col '{time_col}' not found in CSV columns: {df.columns.tolist()}")
+
+    df = df[[user_col, item_col, time_col]]
+    df = df.dropna()
+    df = df.sort_values([user_col, time_col])
+
     interactions = []
-    with open(path, 'r') as f:
-        for line in f:
-            obj = json.loads(line)
-            uid = obj["reviewerID"]
-            iid = obj["asin"]
-            t = int(obj["unixReviewTime"])
-            interactions.append((uid, iid, t))
+    for row in df.itertuples(index=False):
+        uid = getattr(row, user_col)
+        iid = getattr(row, item_col)
+        t = getattr(row, time_col)
+        try:
+            t_int = int(t)
+        except Exception:
+            t_int = 0
+        interactions.append((uid, iid, t_int))
+
     changed = True
     while changed:
         changed = False
@@ -34,9 +59,11 @@ def load_amazon_beauty(path, min_uc=5, min_ic=5):
         if len(filtered) != len(interactions):
             changed = True
             interactions = filtered
+
     user_interactions = defaultdict(list)
     for u, i, t in interactions:
         user_interactions[u].append((t, i))
+
     user_sequences = {}
     for u, li in user_interactions.items():
         li.sort(key=lambda x: x[0])
@@ -182,8 +209,6 @@ class SASRec(nn.Module):
 
     def compute_session_rep(self, seq, hidden_states):
         B, L, D = hidden_states.size()
-        device = hidden_states.device
-
         mask = (seq > 0).unsqueeze(-1)
 
         lengths = mask.sum(dim=1).clamp(min=1)
@@ -246,7 +271,7 @@ def evaluate_hr_ndcg(model, data_loader, device, k=20):
 
 
 def train_sasrec(
-    data_path="Beauty.json",
+    data_path="data/log_random_4_22_to_5_08_pure.csv",
     max_len=50,
     batch_size=256,
     d_model=128,
@@ -261,14 +286,16 @@ def train_sasrec(
     lambda_l2=1e-6,
     device="cuda" if torch.cuda.is_available() else "cpu",
 ):
-    """
-    mode:
-        0 or default: original CrossEntropy SASRec
-        1: reserved for IPS/SNIPS (currently same as 0)
-        2: BaSe objective
-    """
     print("Loading data...")
-    user_sequences = load_amazon_beauty(data_path, min_uc=5, min_ic=5)
+    user_sequences = load_kuairand_pure(
+        data_path,
+        min_uc=3,
+        min_ic=5,
+        user_col="user_id",
+        item_col="video_id",
+        time_col="time_ms",
+        click_col="is_click",
+    )
     item2id, id2item = build_item_mapping(user_sequences)
     (train_seqs, train_tgts), (val_seqs, val_tgts), (test_seqs, test_tgts), item_pop = \
         build_luo_instances(user_sequences, item2id, max_len=max_len)
@@ -358,11 +385,17 @@ def train_sasrec(
 
                 probs = F.softmax(tilde_s, dim=1)
                 p_mean = probs.mean(dim=0)
+
                 p_nonpad = p_mean[1:]
                 mu_nonpad = mu[1:]
+
+                p_nonpad = p_nonpad / (p_nonpad.sum() + 1e-8)
+                mu_nonpad = mu_nonpad / (mu_nonpad.sum() + 1e-8)
+
                 eps = 1e-8
                 p_nonpad = p_nonpad + eps
                 mu_nonpad = mu_nonpad + eps
+
                 l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
 
                 l2_reg = torch.tensor(0.0, device=device)
@@ -432,7 +465,7 @@ if __name__ == "__main__":
     print(f"Running mode = {mode_idx} (0: SASRec, 1: IPS/SNIPS, 2: BaSe)")
 
     model, item2id, id2item = train_sasrec(
-        data_path="Beauty.json",
+        data_path="Kuai/data/log_random_4_22_to_5_08_pure.csv",
         max_len=50,
         batch_size=256,
         n_epochs=200,
