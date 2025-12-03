@@ -16,6 +16,6 @@ We set the default dataset as "Luxury_Beauty_5.json", which can be found in the 
 ## Execution
 
 - python [model_name].py [idx]
-  - idx = 0 -> default (original model)
+  - idx = 0 (default) -> original model
   - idx = 1 -> IPS/SNIPS
   - idx = 2 -> BaSe
