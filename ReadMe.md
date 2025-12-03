@@ -9,5 +9,5 @@ We propose **Bias-aware Adaptive Loss for Sequential Recommendation (BaSe)**.
 
 ## Execution
 
-- python [base_model]__plus__[loss_type].py
+- python [base_model]_ plus _[loss_type].py
 
