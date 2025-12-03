@@ -15,5 +15,5 @@ We set the default dataset as "Luxury_Beauty_5.json", which can be found in the 
 
 ## Execution
 
-- python [base_model]_ plus _[loss_type].py
+- python [model_name].py
 
