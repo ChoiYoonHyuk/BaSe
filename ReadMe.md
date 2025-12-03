@@ -11,7 +11,7 @@ We propose **Bias-aware Adaptive Loss for Sequential Recommendation (BaSe)**.
 
 We set the default dataset as "KuaiRand-Pure.json", which can be found in the following link:
 
-- https://cseweb.ucsd.edu/~jmcauley/datasets/amazon_v2/
+- https://kuairand.com/
 
 ## Execution
 
