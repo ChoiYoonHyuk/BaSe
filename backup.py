@@ -2,9 +2,11 @@ import json
 from collections import defaultdict
 import random
 import math
+import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -57,10 +59,18 @@ def build_luo_instances(user_sequences, item2id, max_len=50):
     train_seqs, train_tgts = [], []
     val_seqs, val_tgts = [], []
     test_seqs, test_tgts = [], []
+
+    num_items = len(item2id)
+    item_pop = [0.0] * (num_items + 1)
+
     for seq in user_sequences.values():
         mapped = [item2id[i] for i in seq if i in item2id]
         if len(mapped) < 3:
             continue
+
+        for iid in mapped:
+            item_pop[iid] += 1.0
+
         T = len(mapped)
         for t in range(1, T - 2):
             src = mapped[:t]
@@ -71,6 +81,7 @@ def build_luo_instances(user_sequences, item2id, max_len=50):
                 src = [0] * (max_len - len(src)) + src
             train_seqs.append(src)
             train_tgts.append(tgt)
+
         val_src = mapped[: T - 2]
         val_tgt = mapped[T - 2]
         if len(val_src) >= max_len:
@@ -79,6 +90,7 @@ def build_luo_instances(user_sequences, item2id, max_len=50):
             val_src = [0] * (max_len - len(val_src)) + val_src
         val_seqs.append(val_src)
         val_tgts.append(val_tgt)
+
         test_src = mapped[: T - 1]
         test_tgt = mapped[T - 1]
         if len(test_src) >= max_len:
@@ -87,7 +99,8 @@ def build_luo_instances(user_sequences, item2id, max_len=50):
             test_src = [0] * (max_len - len(test_src)) + test_src
         test_seqs.append(test_src)
         test_tgts.append(test_tgt)
-    return (train_seqs, train_tgts), (val_seqs, val_tgts), (test_seqs, test_tgts)
+
+    return (train_seqs, train_tgts), (val_seqs, val_tgts), (test_seqs, test_tgts), item_pop
 
 
 class BeautySeqDataset(Dataset):
@@ -115,6 +128,7 @@ class SASRec(nn.Module):
         super().__init__()
         self.num_items = num_items
         self.max_len = max_len
+        self.recent_k = min(5, max_len)
 
         self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
         self.pos_emb = nn.Embedding(max_len, d_model)
@@ -137,7 +151,19 @@ class SASRec(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model)
         self.fc_out = nn.Linear(d_model, num_items + 1)
 
-    def forward(self, seq):
+        self.psi = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+        )
+        self.rho = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+        )
+        self.W_US = nn.Linear(d_model, d_model)
+        self.W_gamma = nn.Linear(2 * d_model, 1)
+        self.alpha_layer = nn.Linear(d_model, 1)
+
+    def forward(self, seq, return_session_rep=False):
         device = seq.device
         B, L = seq.size()
         item_emb = self.item_emb(seq)
@@ -148,12 +174,48 @@ class SASRec(nn.Module):
         x = self.layer_norm(x)
         x = self.encoder(x)
         logits = self.fc_out(x)
+
+        if return_session_rep:
+            z_US = self.compute_session_rep(seq, x)
+            return logits, z_US
         return logits
 
-    def predict_next(self, seq):
-        logits = self.forward(seq)
-        last_logits = logits[:, -1, :]
-        return last_logits
+    def compute_session_rep(self, seq, hidden_states):
+        B, L, D = hidden_states.size()
+        device = hidden_states.device
+
+        mask = (seq > 0).unsqueeze(-1)
+
+        lengths = mask.sum(dim=1).clamp(min=1)
+        h_masked = hidden_states * mask
+        z_U = h_masked.sum(dim=1) / lengths
+
+        k = min(self.recent_k, L)
+        recent_h = hidden_states[:, -k:, :]
+        recent_mask = (seq[:, -k:] > 0).unsqueeze(-1)
+        recent_len = recent_mask.sum(dim=1).clamp(min=1)
+        recent_h_masked = recent_h * recent_mask
+        r_mean = recent_h_masked.sum(dim=1) / recent_len
+
+        r = self.rho(self.psi(r_mean))
+
+        concat = torch.cat([z_U, r], dim=-1)
+        delta = torch.sigmoid(self.W_gamma(concat))
+
+        z_mix = delta * z_U + (1.0 - delta) * r
+        z_US = self.W_US(z_mix)
+        return z_US
+
+    def predict_next(self, seq, return_session_rep=False):
+        out = self.forward(seq, return_session_rep=return_session_rep)
+        if return_session_rep:
+            logits, z_US = out
+            last_logits = logits[:, -1, :]
+            return last_logits, z_US
+        else:
+            logits = out
+            last_logits = logits[:, -1, :]
+            return last_logits
 
 
 def evaluate_hr_ndcg(model, data_loader, device, k=20):
@@ -194,14 +256,22 @@ def train_sasrec(
     n_epochs=200,
     patience=20,
     k_eval=20,
+    mode=0,
+    lambda_cal=1e-2,
+    lambda_l2=1e-6,
     device="cuda" if torch.cuda.is_available() else "cpu",
 ):
+    """
+    mode:
+        0 or default: original CrossEntropy SASRec
+        1: reserved for IPS/SNIPS (currently same as 0)
+        2: BaSe objective
+    """
     print("Loading data...")
     user_sequences = load_amazon_beauty(data_path, min_uc=5, min_ic=5)
     item2id, id2item = build_item_mapping(user_sequences)
-    (train_seqs, train_tgts), (val_seqs, val_tgts), (test_seqs, test_tgts) = build_luo_instances(
-        user_sequences, item2id, max_len=max_len
-    )
+    (train_seqs, train_tgts), (val_seqs, val_tgts), (test_seqs, test_tgts), item_pop = \
+        build_luo_instances(user_sequences, item2id, max_len=max_len)
 
     train_dataset = BeautySeqDataset(train_seqs, train_tgts)
     val_dataset = BeautySeqDataset(val_seqs, val_tgts)
@@ -228,6 +298,31 @@ def train_sasrec(
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    if mode == 2:
+        eps = 1e-8
+        pop = torch.tensor(item_pop, dtype=torch.float)
+        pop[0] = 0.0
+        pop[1:] = pop[1:] + 1e-3
+        q_pop = pop.pow(0.75)
+        if q_pop[1:].sum() <= 0:
+            q_pop[1:] = 1.0
+        q_pop[1:] = q_pop[1:] / (q_pop[1:].sum() + eps)
+        q_pop[0] = eps
+
+        mu = torch.zeros_like(q_pop)
+        if num_items > 0:
+            mu[1:] = 1.0 / num_items
+
+        log_q = torch.log(q_pop + eps)
+
+        omega = mu / (q_pop + eps)
+        omega_sum = omega[1:].sum() + eps
+        w_tilde = omega / omega_sum
+
+        log_q = log_q.to(device)
+        w_tilde = w_tilde.to(device)
+        mu = mu.to(device)
+
     best_val_ndcg = 0.0
     best_state = None
     best_epoch = 0
@@ -241,17 +336,57 @@ def train_sasrec(
             tgt_batch = tgt_batch.to(device)
 
             optimizer.zero_grad()
-            logits = model.predict_next(seq_batch)
-            logits = torch.clamp(logits, -20.0, 20.0)
-            loss = criterion(logits, tgt_batch)
+
+            if mode == 2:
+                logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
+                logits = torch.clamp(logits, -20.0, 20.0)
+                B, V = logits.size()
+
+                alpha = F.softplus(model.alpha_layer(z_US)).view(B, 1)
+
+                tilde_s = logits - alpha * log_q.unsqueeze(0)
+                tilde_s = torch.clamp(tilde_s, -20.0, 20.0)
+
+                log_probs = F.log_softmax(tilde_s, dim=1)
+                batch_idx = torch.arange(B, device=device)
+                log_p_y = log_probs[batch_idx, tgt_batch]
+
+                iw = w_tilde[tgt_batch]
+                iw = torch.where(tgt_batch > 0, iw, torch.zeros_like(iw))
+
+                loss_iw_ce = - (iw * log_p_y).mean()
+
+                probs = F.softmax(tilde_s, dim=1)
+                p_mean = probs.mean(dim=0)
+                p_nonpad = p_mean[1:]
+                mu_nonpad = mu[1:]
+                eps = 1e-8
+                p_nonpad = p_nonpad + eps
+                mu_nonpad = mu_nonpad + eps
+                l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
+
+                l2_reg = torch.tensor(0.0, device=device)
+                if lambda_l2 > 0.0:
+                    for param in model.parameters():
+                        l2_reg = l2_reg + param.pow(2).sum()
+
+                loss = loss_iw_ce + lambda_cal * l_cal + lambda_l2 * l2_reg
+
+            else:
+                logits = model.predict_next(seq_batch)
+                logits = torch.clamp(logits, -20.0, 20.0)
+                loss = criterion(logits, tgt_batch)
+
             if torch.isnan(loss):
                 print("NaN loss detected, breaking")
                 if best_state is not None:
                     model.load_state_dict(best_state)
                 return model, item2id, id2item
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
+
             total_loss += loss.item() * seq_batch.size(0)
 
         avg_train_loss = total_loss / len(train_dataset)
@@ -286,6 +421,16 @@ def train_sasrec(
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        try:
+            mode_idx = int(sys.argv[1])
+        except ValueError:
+            mode_idx = 0
+    else:
+        mode_idx = 0
+
+    print(f"Running mode = {mode_idx} (0: SASRec, 1: IPS/SNIPS, 2: BaSe)")
+
     model, item2id, id2item = train_sasrec(
         data_path="Beauty.json",
         max_len=50,
@@ -293,4 +438,5 @@ if __name__ == "__main__":
         n_epochs=200,
         patience=20,
         k_eval=20,
+        mode=mode_idx,
     )
