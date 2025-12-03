@@ -5,7 +5,13 @@
 
 ## Overview
 
-We propose **Bias-aware Adaptive Loss for Sequential Recommendation (BaSe)**.
+We propose **Bias-aware Adaptive Loss for Sequential Recommendation (BaSe)**. 
+
+## Dataset
+
+We set the default dataset as "Luxury_Beauty_5.json", which can be found in the following link:
+
+- https://cseweb.ucsd.edu/~jmcauley/datasets/amazon_v2/
 
 ## Execution
 
