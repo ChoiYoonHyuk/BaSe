@@ -526,13 +526,13 @@ if __name__ == "__main__":
         user_col = "reviewerID"
         item_col = "asin"
         time_col = "unixReviewTime"
-    if args.dataset == "sports":
+    elif args.dataset == "sports":
         data_root = "./datasets/"
         dataset_file = "Sports.json"
         user_col = "reviewerID"
         item_col = "asin"
         time_col = "unixReviewTime"
-    if args.dataset == "beauty":
+    elif args.dataset == "beauty":
         data_root = "./datasets/"
         dataset_file = "Beauty.json"
         user_col = "reviewerID"
