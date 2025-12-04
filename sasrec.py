@@ -2,6 +2,7 @@ import math
 import sys
 import random
 from pathlib import Path
+import argparse
 
 import pandas as pd
 
@@ -10,6 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+
+# ======================
+# Data utils
+# ======================
 
 def load_sequences(
     data_root,
@@ -138,6 +143,10 @@ class SeqDataset(Dataset):
         return self.sequences[idx], self.targets[idx]
 
 
+# ======================
+# Model
+# ======================
+
 class SASRec(nn.Module):
     def __init__(
         self,
@@ -174,6 +183,7 @@ class SASRec(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model)
         self.fc_out = nn.Linear(d_model, num_items + 1)
 
+        # For BaSe
         self.psi = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -239,6 +249,10 @@ class SASRec(nn.Module):
             return last_logits
 
 
+# ======================
+# Evaluation
+# ======================
+
 def evaluate_hr_ndcg(model, data_loader, device, k=20):
     model.eval()
     total_hr = 0.0
@@ -266,9 +280,16 @@ def evaluate_hr_ndcg(model, data_loader, device, k=20):
     return hr, ndcg
 
 
+# ======================
+# Training
+# ======================
+
 def train_sasrec(
     data_root=".",
     dataset="",
+    user_col="reviewerID",
+    item_col="asin",
+    time_col="unixReviewTime",
     max_len=50,
     batch_size=256,
     d_model=128,
@@ -282,16 +303,19 @@ def train_sasrec(
     alpha=1.0,
     lambda_cal=1e-3,
     lambda_l2=1e-6,
-    device="cuda:1" if torch.cuda.is_available() else "cpu",
+    device=None,
 ):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     print(f"Loading data ({dataset})...")
 
     user_sequences = load_sequences(
         data_root=data_root,
         dataset=dataset,
-        user_col="reviewerID",
-        item_col="asin",
-        time_col="unixReviewTime",
+        user_col=user_col,
+        item_col=item_col,
+        time_col=time_col,
         min_seq_len=3,
     )
 
@@ -330,6 +354,7 @@ def train_sasrec(
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    # Pre-compute BaSe statistics
     if mode == 2:
         eps = 1e-8
         pop = torch.tensor(item_pop, dtype=torch.float)
@@ -370,6 +395,7 @@ def train_sasrec(
             optimizer.zero_grad()
 
             if mode == 2:
+                # BaSe
                 logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                 logits = torch.clamp(logits, -20.0, 20.0)
                 B, _ = logits.size()
@@ -385,6 +411,7 @@ def train_sasrec(
                 iw = w_tilde[tgt_batch]
                 iw = torch.where(tgt_batch > 0, iw, torch.zeros_like(iw))
 
+                # SNIPS-style normalization
                 loss_iw_ce = - (iw * log_p_y).sum() / (iw.sum() + 1e-8)
 
                 probs = F.softmax(tilde_s, dim=1)
@@ -456,25 +483,88 @@ def train_sasrec(
     return model, item2id, id2item
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        try:
-            mode_idx = int(sys.argv[1])
-        except ValueError:
-            mode_idx = 0
-    else:
-        mode_idx = 0
+# ======================
+# Main: dataset & model
+# ======================
 
-    print(f"Running mode = {mode_idx} (0: SASRec, 1: IPS/SNIPS, 2: BaSe)")
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["toys", "beauty", "sports", "yelp"],
+        default="toys",
+        help="Dataset selection",
+    )
+    parser.add_argument(
+        "--mode",
+        type=int,
+        choices=[0, 1, 2],
+        default=0,
+        help="0: SASRec, 1: IPS/SNIPS, 2: BaSe",
+    )
+    parser.add_argument("--max_len", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--n_epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--k_eval", type=int, default=20)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--lambda_cal", type=float, default=1e-3)
+    parser.add_argument("--lambda_l2", type=float, default=1e-6)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--device", type=str, default=None)
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.dataset == "toys":
+        data_root = "./datasets/"
+        dataset_file = "Toys.json"
+        user_col = "reviewerID"
+        item_col = "asin"
+        time_col = "unixReviewTime"
+    if args.dataset == "sports":
+        data_root = "./datasets/"
+        dataset_file = "Sports.json"
+        user_col = "reviewerID"
+        item_col = "asin"
+        time_col = "unixReviewTime"
+    if args.dataset == "beauty":
+        data_root = "./datasets/"
+        dataset_file = "Beauty.json"
+        user_col = "reviewerID"
+        item_col = "asin"
+        time_col = "unixReviewTime"
+    elif args.dataset == "yelp":
+        data_root = "./datasets/yelp"
+        dataset_file = "yelp_academic_dataset_review.json"
+        user_col = "user_id"
+        item_col = "business_id"
+        time_col = "date"
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    print(f"Running mode = {args.mode} (0: SASRec, 1: IPS/SNIPS, 2: BaSe)")
+    print(f"Using dataset = {args.dataset} ({dataset_file})")
 
     model, item2id, id2item = train_sasrec(
-        data_root="./datasets/",
-        dataset="Toys.json",
-        max_len=50,
-        batch_size=256,
-        n_epochs=200,
-        patience=20,
-        k_eval=20,
-        mode=mode_idx,
-        alpha=1.0,
+        data_root=data_root,
+        dataset=dataset_file,
+        user_col=user_col,
+        item_col=item_col,
+        time_col=time_col,
+        max_len=args.max_len,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        patience=args.patience,
+        k_eval=args.k_eval,
+        mode=args.mode,
+        alpha=args.alpha,
+        lambda_cal=args.lambda_cal,
+        lambda_l2=args.lambda_l2,
+        lr=args.lr,
+        device=args.device,
     )
