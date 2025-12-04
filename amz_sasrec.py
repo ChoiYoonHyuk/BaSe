@@ -1,6 +1,6 @@
 import math
 import sys
-from collections import defaultdict
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -13,14 +13,14 @@ from torch.utils.data import Dataset, DataLoader
 
 def load_beauty_sequences(
     data_root,
-    beauty_file="Beauty.json",
+    dataset="Beauty.json",
     user_col="reviewerID",
     item_col="asin",
     time_col="unixReviewTime",
     min_seq_len=3,
 ):
     data_root = Path(data_root)
-    json_path = data_root / beauty_file
+    json_path = data_root / dataset
     if not json_path.exists():
         raise FileNotFoundError(f"Beauty.json not found at: {json_path}")
 
@@ -56,7 +56,7 @@ def build_item_mapping(user_sequences):
     return item2id, id2item
 
 
-def build_luo_instances(user_sequences, item2id, max_len=50):
+def build_luo_instances(user_sequences, item2id, max_len=50, alpha=1.0, inject_bias=True):
     train_seqs, train_tgts = [], []
     val_seqs, val_tgts = [], []
     test_seqs, test_tgts = [], []
@@ -64,15 +64,29 @@ def build_luo_instances(user_sequences, item2id, max_len=50):
     num_items = len(item2id)
     item_pop = [0.0] * (num_items + 1)
 
+    mapped_seqs = []
     for seq in user_sequences.values():
         mapped = [item2id[i] for i in seq if i in item2id]
         if len(mapped) < 3:
             continue
-
+        mapped_seqs.append(mapped)
         for iid in mapped:
             item_pop[iid] += 1.0
 
+    if inject_bias:
+        pop_pow = [c**alpha for c in item_pop]
+        pop_pow[0] = 0.0
+        Z = sum(pop_pow[1:])
+        if Z > 0.0:
+            item_prob = [c / Z for c in pop_pow]
+        else:
+            item_prob = [0.0] * (num_items + 1)
+    else:
+        item_prob = None
+
+    for mapped in mapped_seqs:
         T = len(mapped)
+
         for t in range(1, T - 2):
             src = mapped[:t]
             tgt = mapped[t]
@@ -80,6 +94,14 @@ def build_luo_instances(user_sequences, item2id, max_len=50):
                 src = src[-max_len:]
             else:
                 src = [0] * (max_len - len(src)) + src
+
+            if inject_bias:
+                p_keep = item_prob[tgt] if item_prob is not None else 1.0
+                if p_keep <= 0.0:
+                    continue
+                if random.random() > p_keep:
+                    continue
+
             train_seqs.append(src)
             train_tgts.append(tgt)
 
@@ -246,7 +268,7 @@ def evaluate_hr_ndcg(model, data_loader, device, k=20):
 
 def train_sasrec(
     data_root=".",
-    beauty_file="Beauty.json",
+    dataset="",
     max_len=50,
     batch_size=256,
     d_model=128,
@@ -257,15 +279,16 @@ def train_sasrec(
     patience=20,
     k_eval=20,
     mode=0,
+    alpha=1.0,
     lambda_cal=1e-2,
     lambda_l2=1e-6,
     device="cuda" if torch.cuda.is_available() else "cpu",
 ):
-    print("Loading Amazon Beauty data...")
+    print(f"Loading data ({dataset})...")
 
     user_sequences = load_beauty_sequences(
         data_root=data_root,
-        beauty_file=beauty_file,
+        dataset=dataset,
         user_col="reviewerID",
         item_col="asin",
         time_col="unixReviewTime",
@@ -274,7 +297,13 @@ def train_sasrec(
 
     item2id, id2item = build_item_mapping(user_sequences)
     (train_seqs, train_tgts), (val_seqs, val_tgts), (test_seqs, test_tgts), item_pop = \
-        build_luo_instances(user_sequences, item2id, max_len=max_len)
+        build_luo_instances(
+            user_sequences,
+            item2id=item2id,
+            max_len=max_len,
+            alpha=alpha,
+            inject_bias=True,
+        )
 
     train_dataset = BeautySeqDataset(train_seqs, train_tgts)
     val_dataset = BeautySeqDataset(val_seqs, val_tgts)
@@ -345,8 +374,8 @@ def train_sasrec(
                 logits = torch.clamp(logits, -20.0, 20.0)
                 B, _ = logits.size()
 
-                alpha = F.softplus(model.alpha_layer(z_US)).view(B, 1)
-                tilde_s = logits - alpha * log_q.unsqueeze(0)
+                alpha_vec = F.softplus(model.alpha_layer(z_US)).view(B, 1)
+                tilde_s = logits - alpha_vec * log_q.unsqueeze(0)
                 tilde_s = torch.clamp(tilde_s, -20.0, 20.0)
 
                 log_probs = F.log_softmax(tilde_s, dim=1)
@@ -440,11 +469,12 @@ if __name__ == "__main__":
 
     model, item2id, id2item = train_sasrec(
         data_root="./datasets/",
-        beauty_file="Beauty.json",
+        dataset="Sports.json",
         max_len=50,
         batch_size=256,
         n_epochs=200,
         patience=20,
         k_eval=20,
         mode=mode_idx,
+        alpha=1.0,
     )
