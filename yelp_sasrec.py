@@ -285,7 +285,7 @@ def train_sasrec(
     alpha=1.0,
     lambda_cal=1e-2,
     lambda_l2=1e-6,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device="cuda:2" if torch.cuda.is_available() else "cpu",
 ):
     print(f"Loading data ({dataset})...")
 
@@ -471,7 +471,7 @@ if __name__ == "__main__":
     print(f"Running mode = {mode_idx} (0: SASRec, 1: IPS/SNIPS, 2: BaSe)")
 
     model, item2id, id2item = train_sasrec(
-        data_root="./datasets/",
+        data_root="./datasets/yelp",
         dataset="yelp_academic_dataset_review.json",
         user_col="user_id",
         item_col="business_id",
