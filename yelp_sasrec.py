@@ -472,7 +472,7 @@ if __name__ == "__main__":
 
     model, item2id, id2item = train_sasrec(
         data_root="./datasets/",
-        dataset="yelp_academic_dataset_review.json",  # Yelp 리뷰 파일
+        dataset="yelp_academic_dataset_review.json",
         user_col="user_id",
         item_col="business_id",
         time_col="date",
