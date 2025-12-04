@@ -12,6 +12,25 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
+# ======================
+# Data utils
+# ======================
+
+def filter_5core(df, user_col, item_col, min_cnt=5):
+    while True:
+        before = len(df)
+        user_counts = df[user_col].value_counts()
+        item_counts = df[item_col].value_counts()
+
+        df = df[df[user_col].isin(user_counts[user_counts >= min_cnt].index)]
+        df = df[df[item_col].isin(item_counts[item_counts >= min_cnt].index)]
+
+        after = len(df)
+        if after == before:
+            break
+    return df
+
+
 def load_sequences(
     data_root,
     dataset="",
@@ -34,6 +53,11 @@ def load_sequences(
             )
 
     df = df[[user_col, item_col, time_col]].dropna()
+
+    dataset_str = str(dataset).lower()
+    if ("beauty" not in dataset_str):
+        df = filter_5core(df, user_col=user_col, item_col=item_col, min_cnt=5)
+
     df = df.sort_values([user_col, time_col])
 
     user_sequences = {}
@@ -138,6 +162,10 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx):
         return self.sequences[idx], self.targets[idx]
 
+
+# ======================
+# Models
+# ======================
 
 class BaseCalibratedModel(nn.Module):
     def __init__(self, d_model):
@@ -576,6 +604,10 @@ def build_model(model_name, num_items, max_len=50, d_model=128, n_heads=2, n_lay
         raise ValueError(f"Unknown model_name: {model_name}")
 
 
+# ======================
+# Evaluation
+# ======================
+
 def evaluate_hr_ndcg(model, data_loader, device, k=20):
     model.eval()
     total_hr = 0.0
@@ -602,6 +634,58 @@ def evaluate_hr_ndcg(model, data_loader, device, k=20):
     ndcg = total_ndcg / total
     return hr, ndcg
 
+
+def evaluate_hr_ndcg_neg_sampling(model, data_loader, device, num_items, k=20, num_neg=100):
+    model.eval()
+    total_hr = 0.0
+    total_ndcg = 0.0
+    total = 0
+
+    with torch.no_grad():
+        for seq_batch, tgt_batch in data_loader:
+            seq_batch = seq_batch.to(device)
+            tgt_batch = tgt_batch.to(device)
+            B, L = seq_batch.size()
+
+            logits_all = model.predict_next(seq_batch)  # (B, num_items+1)
+
+            for i in range(B):
+                target = tgt_batch[i].item()
+                if target == 0:
+                    continue
+
+                user_items = set(seq_batch[i].tolist())
+                user_items.add(target)
+
+                negs = []
+                while len(negs) < num_neg:
+                    neg = random.randint(1, num_items)
+                    if neg not in user_items:
+                        negs.append(neg)
+
+                candidates = [target] + negs
+                cand_ids = torch.tensor(candidates, device=device, dtype=torch.long)
+                cand_scores = logits_all[i, cand_ids]
+
+                topk_scores, topk_idx = torch.topk(cand_scores, k)
+                topk_items = cand_ids[topk_idx].tolist()
+
+                if target in topk_items:
+                    total_hr += 1.0
+                    rank = topk_items.index(target)
+                    total_ndcg += 1.0 / math.log2(rank + 2)
+                total += 1
+
+    if total == 0:
+        return 0.0, 0.0
+    hr = total_hr / total
+    ndcg = total_ndcg / total
+    return hr, ndcg
+
+
+# ======================
+# Training
+# ======================
 
 def train_model(
     model_name="sasrec",
@@ -662,6 +746,9 @@ def train_model(
         f"[{model_name}] #users = {len(user_sequences)}, #items = {num_items}, "
         f"#train = {len(train_dataset)}, #val = {len(val_dataset)}, #test = {len(test_dataset)}"
     )
+
+    ds_str = str(dataset).lower()
+    use_neg_sampling_eval = ("toys" in ds_str) or ("sports" in ds_str)
 
     model = build_model(
         model_name=model_name,
@@ -799,7 +886,15 @@ def train_model(
             total_loss += loss.item() * seq_batch.size(0)
 
         avg_train_loss = total_loss / len(train_dataset)
-        val_hr, val_ndcg = evaluate_hr_ndcg(model, val_loader, device, k=k_eval)
+
+        if use_neg_sampling_eval:
+            val_hr, val_ndcg = evaluate_hr_ndcg_neg_sampling(
+                model, val_loader, device, num_items, k=k_eval, num_neg=100
+            )
+        else:
+            val_hr, val_ndcg = evaluate_hr_ndcg(
+                model, val_loader, device, k=k_eval
+            )
 
         if val_ndcg > best_val_ndcg:
             best_val_ndcg = val_ndcg
@@ -822,11 +917,23 @@ def train_model(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    test_hr, test_ndcg = evaluate_hr_ndcg(model, test_loader, device, k=k_eval)
+    if use_neg_sampling_eval:
+        test_hr, test_ndcg = evaluate_hr_ndcg_neg_sampling(
+            model, test_loader, device, num_items, k=k_eval, num_neg=100
+        )
+    else:
+        test_hr, test_ndcg = evaluate_hr_ndcg(
+            model, test_loader, device, k=k_eval
+        )
+
     print(f"[{model_name}] Final Test HR@{k_eval} = {test_hr:.4f} | Test NDCG@{k_eval} = {test_ndcg:.4f}")
 
     return model, item2id, id2item
 
+
+# ======================
+# Main
+# ======================
 
 def parse_args():
     parser = argparse.ArgumentParser()
