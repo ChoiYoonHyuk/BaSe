@@ -12,7 +12,7 @@ Overview of the proposed method (BaSe). Given scores from any SR backbone and sa
 The dataset can be found at the following link:
 
 - https://cseweb.ucsd.edu/~jmcauley/datasets/amazon_v2/ (Amazon)
-- yelp.com/dataset (Yelp)
+- https://yelp.com/dataset (Yelp)
 
 ## Execution
 
