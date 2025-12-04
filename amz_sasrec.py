@@ -11,9 +11,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
-def load_beauty_sequences(
+def load_sequences(
     data_root,
-    dataset="Beauty.json",
+    dataset="",
     user_col="reviewerID",
     item_col="asin",
     time_col="unixReviewTime",
@@ -22,14 +22,14 @@ def load_beauty_sequences(
     data_root = Path(data_root)
     json_path = data_root / dataset
     if not json_path.exists():
-        raise FileNotFoundError(f"Beauty.json not found at: {json_path}")
+        raise FileNotFoundError(f".json not found at: {json_path}")
 
     df = pd.read_json(json_path, lines=True)
 
     for col in [user_col, item_col, time_col]:
         if col not in df.columns:
             raise ValueError(
-                f"Column '{col}' not found in Beauty.json columns: {df.columns.tolist()}"
+                f"Column '{col}' not found in .json columns: {df.columns.tolist()}"
             )
 
     df = df[[user_col, item_col, time_col]].dropna()
@@ -126,7 +126,7 @@ def build_luo_instances(user_sequences, item2id, max_len=50, alpha=1.0, inject_b
     return (train_seqs, train_tgts), (val_seqs, val_tgts), (test_seqs, test_tgts), item_pop
 
 
-class BeautySeqDataset(Dataset):
+class SeqDataset(Dataset):
     def __init__(self, sequences, targets):
         self.sequences = torch.tensor(sequences, dtype=torch.long)
         self.targets = torch.tensor(targets, dtype=torch.long)
@@ -280,13 +280,13 @@ def train_sasrec(
     k_eval=20,
     mode=0,
     alpha=1.0,
-    lambda_cal=1e-2,
+    lambda_cal=1e-3,
     lambda_l2=1e-6,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device="cuda:1" if torch.cuda.is_available() else "cpu",
 ):
     print(f"Loading data ({dataset})...")
 
-    user_sequences = load_beauty_sequences(
+    user_sequences = load_sequences(
         data_root=data_root,
         dataset=dataset,
         user_col="reviewerID",
@@ -305,9 +305,9 @@ def train_sasrec(
             inject_bias=True,
         )
 
-    train_dataset = BeautySeqDataset(train_seqs, train_tgts)
-    val_dataset = BeautySeqDataset(val_seqs, val_tgts)
-    test_dataset = BeautySeqDataset(test_seqs, test_tgts)
+    train_dataset = SeqDataset(train_seqs, train_tgts)
+    val_dataset = SeqDataset(val_seqs, val_tgts)
+    test_dataset = SeqDataset(test_seqs, test_tgts)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -315,7 +315,7 @@ def train_sasrec(
 
     num_items = len(item2id)
     print(
-        f"[Beauty] #users = {len(user_sequences)}, #items = {num_items}, "
+        f"#users = {len(user_sequences)}, #items = {num_items}, "
         f"#train instances = {len(train_dataset)}, #val = {len(val_dataset)}, #test = {len(test_dataset)}"
     )
 
@@ -385,7 +385,7 @@ def train_sasrec(
                 iw = w_tilde[tgt_batch]
                 iw = torch.where(tgt_batch > 0, iw, torch.zeros_like(iw))
 
-                loss_iw_ce = - (iw * log_p_y).mean()
+                loss_iw_ce = - (iw * log_p_y).sum() / (iw.sum() + 1e-8)
 
                 probs = F.softmax(tilde_s, dim=1)
                 p_mean = probs.mean(dim=0)
@@ -469,7 +469,7 @@ if __name__ == "__main__":
 
     model, item2id, id2item = train_sasrec(
         data_root="./datasets/",
-        dataset="Sports.json",
+        dataset="Toys.json",
         max_len=50,
         batch_size=256,
         n_epochs=200,
