@@ -5,7 +5,7 @@
 
 ## Overview
 
-We propose **Bias-aware Adaptive Loss for Sequential Recommendation (BaSe)**. 
+Overview of the proposed method (BaSe). Given scores from any SR backbone and samples from a time-varying sampler $q(i \mid u,t)$, BaSe predicts a context-dependent correction factor $\alpha(u,t)$, applies adaptive log-$q$ debiasing, SNIPS reweighting, and calibration to produce debiased training signals.
 
 ## Dataset
 
