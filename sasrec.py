@@ -354,8 +354,20 @@ def train_sasrec(
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Pre-compute BaSe statistics
+    # ---------- Pre-compute stats for mode 1 (IPS/SNIPS) and mode 2 (BaSe) ----------
+    propensity = None  # for mode 1
+    if mode == 1:
+        eps = 1e-8
+        pop = torch.tensor(item_pop, dtype=torch.float)
+        pop[0] = 0.0
+        if pop[1:].sum() <= 0:
+            pop[1:] = 1.0
+        pop[1:] = pop[1:] / (pop[1:].sum() + eps)
+        pop[0] = eps  
+        propensity = pop.to(device)  # p(i)
+
     if mode == 2:
+        # BaSe
         eps = 1e-8
         pop = torch.tensor(item_pop, dtype=torch.float)
         pop[0] = 0.0
@@ -395,7 +407,7 @@ def train_sasrec(
             optimizer.zero_grad()
 
             if mode == 2:
-                # BaSe
+                # ----------------- BaSe -----------------
                 logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                 logits = torch.clamp(logits, -20.0, 20.0)
                 B, _ = logits.size()
@@ -436,7 +448,25 @@ def train_sasrec(
 
                 loss = loss_iw_ce + lambda_cal * l_cal + lambda_l2 * l2_reg
 
+            elif mode == 1:
+                # ----------------- mode 1: IPS/SNIPS -----------------
+                logits = model.predict_next(seq_batch)
+                logits = torch.clamp(logits, -20.0, 20.0)
+                B, _ = logits.size()
+
+                log_probs = F.log_softmax(logits, dim=1)
+                batch_idx = torch.arange(B, device=device)
+                log_p_y = log_probs[batch_idx, tgt_batch]
+
+                p_tgt = propensity[tgt_batch]  # shape: (B,)
+                iw = 1.0 / (p_tgt + 1e-8)      # IPS weight
+                iw = torch.where(tgt_batch > 0, iw, torch.zeros_like(iw))
+
+                # SNIPS-style normalization
+                loss = - (iw * log_p_y).sum() / (iw.sum() + 1e-8)
+
             else:
+                # ----------------- standard CE (mode 0) -----------------
                 logits = model.predict_next(seq_batch)
                 logits = torch.clamp(logits, -20.0, 20.0)
                 loss = criterion(logits, tgt_batch)
