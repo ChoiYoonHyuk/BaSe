@@ -9,10 +9,10 @@ Overview of the proposed method (BaSe). Given scores from any SR backbone and sa
 
 ## Dataset
 
-We set the default dataset as "KuaiRand-27K.json", which can be found in the following link:
+The dataset can be found at the following link:
 
-- https://kuairand.com/ (KuaiRand)
 - https://cseweb.ucsd.edu/~jmcauley/datasets/amazon_v2/ (Amazon)
+- yelp.com/dataset (Yelp)
 
 ## Execution
 
