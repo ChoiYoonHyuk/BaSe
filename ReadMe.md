@@ -16,6 +16,11 @@ We set the default dataset as "KuaiRand-27K.json", which can be found in the fol
 
 ## Execution
 
+python main.py \
+  --dataset {toys|beauty|sports|yelp} \
+  --model {sasrec|bert4rec|duorec|core|srgnn|gcsan|gce-gnn|tagnn} \
+  --mode {0|1|2}
+  
 - python [model_name].py --mode [idx] --dataset [dataset]
   - mode
     - idx = 0 (default) -> original model
