@@ -268,7 +268,7 @@ def evaluate_hr_ndcg(model, data_loader, device, k=20):
 
 def train_sasrec(
     data_root=".",
-    dataset="Beauty.json",
+    dataset="",
     user_col="reviewerID",
     item_col="asin",
     time_col="unixReviewTime",
