@@ -16,7 +16,10 @@ We set the default dataset as "KuaiRand-27K.json", which can be found in the fol
 
 ## Execution
 
-- python [model_name].py [idx]
-  - idx = 0 (default) -> original model
-  - idx = 1 -> IPS/SNIPS
-  - idx = 2 -> BaSe
+- python [model_name].py --loss [loss_idx] --dataset [dataset]
+  - loss
+    - idx = 0 (default) -> original model
+    - idx = 1 -> IPS/SNIPS
+    - idx = 2 -> BaSe
+  - dataset
+    - beauty / toys / sports / yelp
