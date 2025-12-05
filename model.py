@@ -1530,6 +1530,7 @@ def train_model(
                     seq_output, z_US = model.forward(seq_batch, return_session_rep=True)
                     logits = model.predict_next(seq_batch)
                     rep_for_alpha = seq_output
+                    logits = 5.0 * logits
                 elif model_name.lower() in ("gcsan", "srgnn", "gce-gnn", "gcegnn", "tagnn", "selfgnn"):
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
@@ -1538,9 +1539,6 @@ def train_model(
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
 
-                if model_name.lower() == "core":
-                    logits = 5.0 * logits
-
                 B, _ = logits.size()
 
                 alpha_vec = F.softplus(model.alpha_layer(rep_for_alpha)).view(B, 1)
@@ -1548,7 +1546,7 @@ def train_model(
                 if model_name.lower() == "duorec":
                     alpha_vec = 0.01 * alpha_vec
                 elif model_name.lower() in ("core", "gcsan", "srgnn", "gce-gnn", "gcegnn", "tagnn", "selfgnn"):
-                    alpha_vec = torch.clamp(alpha_vec, max=0.5)
+                    alpha_vec = 0.5 * alpha_vec
                 else:
                     alpha_vec = torch.clamp(alpha_vec, max=1.0)
                 
@@ -1581,7 +1579,7 @@ def train_model(
                 
                 l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
                 
-                cal_weight = lambda_cal * 0.3
+                cal_weight = lambda_cal * 0.03
                 
                 l2_reg = torch.tensor(0.0, device=device) 
                 if lambda_l2 > 0.0: 
