@@ -1296,7 +1296,7 @@ def train_model(
     n_layers=2,
     lr=1e-3,
     n_epochs=200,
-    patience=20,
+    patience=50,
     k_eval=20,
     mode=0,
     alpha=1.0,
@@ -1461,15 +1461,24 @@ def train_model(
                 if model_name.lower() == "duorec":
                     logits, z_US, z_proj = model.predict_next(seq_batch, return_session_rep=True, return_proj=True)
                     rep_for_alpha = z_proj
+                elif model_name.lower() == "core":
+                    seq_output, z_US = model.forward(seq_batch, return_session_rep=True)
+                    logits = model.predict_next(seq_batch)
+                    rep_for_alpha = seq_output
                 else:
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
 
+                if model_name.lower() == "core":
+                    logits = 5.0 * logits
+                    
                 B, _ = logits.size()
 
                 alpha_vec = F.softplus(model.alpha_layer(rep_for_alpha)).view(B, 1)
                 if model_name.lower() == "duorec":
-                    alpha_vec = 0.5 * alpha_vec
+                    alpha_vec = 0.01 * alpha_vec
+                if model_name.lower() == "core":
+                    alpha_vec = torch.clamp(alpha_vec, max=0.5)
 
                 tilde_s = logits - alpha_vec * log_q.unsqueeze(0)
                 tilde_s = torch.clamp(tilde_s, -20.0, 20.0)
@@ -1501,8 +1510,8 @@ def train_model(
                 l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
 
                 cal_weight = lambda_cal
-                if model_name.lower() == "duorec":
-                    cal_weight = lambda_cal * 0.5
+                if model_name.lower() == "duorec" or "core":
+                    cal_weight = lambda_cal * 0.3
 
                 l2_reg = torch.tensor(0.0, device=device)
                 if lambda_l2 > 0.0:
@@ -1617,7 +1626,7 @@ def parse_args():
     parser.add_argument("--max_len", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--n_epochs", type=int, default=200)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--k_eval", type=int, default=20)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--lambda_cal", type=float, default=1e-3)
