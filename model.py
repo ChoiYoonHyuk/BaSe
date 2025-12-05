@@ -571,111 +571,492 @@ class SRT(BaseCalibratedModel):
         return self.forward(seq, return_session_rep=return_session_rep)
 
 
-class SimpleSessionGNN(BaseCalibratedModel):
-    def __init__(self, num_items, d_model=128, dropout=0.2, readout_type="last"):
+class SRGNN(BaseCalibratedModel):
+    def __init__(self, num_items, d_model=128, dropout=0.2, num_steps=1):
         nn.Module.__init__(self)
         BaseCalibratedModel.__init__(self, d_model)
         self.num_items = num_items
         self.d_model = d_model
+        self.num_steps = num_steps
+
         self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
         nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.02)
         with torch.no_grad():
             self.item_emb.weight[0].zero_()
 
-        self.gnn_linear = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.fc_out = nn.Linear(d_model, num_items + 1)
-        self.readout_type = readout_type
+        self.W_in = nn.Linear(d_model, d_model, bias=False)
+        self.W_out = nn.Linear(d_model, d_model, bias=False)
 
-    def _build_adj_and_nodes(self, items, device):
-        uniq, inverse = torch.unique(items, return_inverse=True)
+        self.W_z = nn.Linear(d_model, d_model)
+        self.U_z = nn.Linear(d_model, d_model, bias=False)
+        self.W_r = nn.Linear(d_model, d_model)
+        self.U_r = nn.Linear(d_model, d_model, bias=False)
+        self.W_h = nn.Linear(d_model, d_model)
+        self.U_h = nn.Linear(d_model, d_model, bias=False)
+
+        self.att_W_q = nn.Linear(d_model, d_model, bias=False)
+        self.att_W_k = nn.Linear(d_model, d_model)
+        self.att_q = nn.Parameter(torch.randn(d_model))
+        self.session_proj = nn.Linear(2 * d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def _build_graph(self, items, device):
+        uniq, inv = torch.unique(items, return_inverse=True)
         n_nodes = uniq.size(0)
         if n_nodes == 1:
-            A = torch.zeros(n_nodes, n_nodes, device=device)
-        else:
-            src = inverse[:-1]
-            dst = inverse[1:]
-            A = torch.zeros(n_nodes, n_nodes, device=device)
-            A[src, dst] = 1.0
+            A_in = torch.zeros(1, 1, device=device)
+            A_out = torch.zeros(1, 1, device=device)
+            return uniq, inv, A_in, A_out
+        A_in = torch.zeros(n_nodes, n_nodes, device=device)
+        A_out = torch.zeros(n_nodes, n_nodes, device=device)
+        src = inv[:-1]
+        dst = inv[1:]
+        A_in[dst, src] += 1.0
+        A_out[src, dst] += 1.0
+        row_in = A_in.sum(dim=1, keepdim=True) + 1e-8
+        row_out = A_out.sum(dim=1, keepdim=True) + 1e-8
+        A_in = A_in / row_in
+        A_out = A_out / row_out
+        return uniq, inv, A_in, A_out
 
-        row_sum = A.sum(dim=1, keepdim=True) + 1e-8
-        A_norm = A / row_sum
-        return uniq, A_norm, inverse
+    def _gnn_propagation(self, h, A_in, A_out):
+        for _ in range(self.num_steps):
+            m_in = A_in @ self.W_in(h)
+            m_out = A_out @ self.W_out(h)
+            m = m_in + m_out
+            z = torch.sigmoid(self.W_z(m) + self.U_z(h))
+            r = torch.sigmoid(self.W_r(m) + self.U_r(h))
+            h_tilde = torch.tanh(self.W_h(m) + self.U_h(r * h))
+            h = (1.0 - z) * h + z * h_tilde
+        return self.dropout(h)
 
     def forward(self, seq, return_session_rep=False):
         device = seq.device
         B, L = seq.size()
-        last_h_list = []
-        all_hidden_for_calib = []
-
+        session_reps = []
+        hidden_for_calib = []
         for b in range(B):
             s = seq[b]
             items = s[s > 0]
             if items.numel() == 0:
-                last_h = torch.zeros(self.d_model, device=device)
-                all_hidden_for_calib.append(last_h.view(1, 1, -1))
-            else:
-                uniq, A_norm, inv = self._build_adj_and_nodes(items, device)
-                node_emb = self.item_emb(uniq)
-                h = F.relu(A_norm @ node_emb)
-                h = self.gnn_linear(h)
-                h = self.dropout(h)
-
-                if self.readout_type == "last":
-                    last_idx = inv[-1]
-                    session_rep = h[last_idx]
-                elif self.readout_type == "mean":
-                    session_rep = h.mean(dim=0)
-                elif self.readout_type == "attn":
-                    q = h[-1]
-                    attn = torch.matmul(h, q)
-                    attn = F.softmax(attn, dim=0)
-                    session_rep = (attn.unsqueeze(-1) * h).sum(dim=0)
-                else:
-                    last_idx = inv[-1]
-                    session_rep = h[last_idx]
-
-                last_h_list.append(session_rep)
-                hidden = session_rep.view(1, 1, -1).repeat(1, L, 1)
-                all_hidden_for_calib.append(hidden)
-
-        last_h_batch = torch.stack(last_h_list, dim=0)
-        logits = self.fc_out(last_h_batch)
-
+                h_s = torch.zeros(self.d_model, device=device)
+                session_reps.append(h_s)
+                hidden_for_calib.append(h_s.view(1, 1, -1).repeat(1, L, 1))
+                continue
+            uniq, inv, A_in, A_out = self._build_graph(items, device)
+            node_emb = self.item_emb(uniq)
+            h = self._gnn_propagation(node_emb, A_in, A_out)
+            seq_h = h[inv]
+            last_h = seq_h[-1]
+            att_in = self.att_W_q(seq_h) + self.att_W_k(last_h).unsqueeze(0)
+            e = torch.tanh(att_in)
+            alpha = torch.softmax(e @ self.att_q, dim=0)
+            s_g = (alpha.unsqueeze(-1) * seq_h).sum(dim=0)
+            s_cat = torch.cat([s_g, last_h], dim=-1)
+            s_rep = self.session_proj(s_cat)
+            session_reps.append(s_rep)
+            hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
+        session_batch = torch.stack(session_reps, dim=0)
+        logits = session_batch @ self.item_emb.weight.t()
         if return_session_rep:
-            hidden_batch = torch.cat(all_hidden_for_calib, dim=0)
+            hidden_batch = torch.cat(hidden_for_calib, dim=0)
             z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
             return logits, z_US
         return logits
 
     def predict_next(self, seq, return_session_rep=False):
         out = self.forward(seq, return_session_rep=return_session_rep)
+        return out
+
+
+class GCSAN(BaseCalibratedModel):
+    def __init__(
+        self,
+        num_items,
+        max_len=50,
+        d_model=128,
+        n_heads=2,
+        n_layers=1,
+        dropout=0.2,
+    ):
+        nn.Module.__init__(self)
+        BaseCalibratedModel.__init__(self, d_model)
+        self.num_items = num_items
+        self.max_len = max_len
+        self.d_model = d_model
+
+        self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+
+        nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.item_emb.weight[0].zero_()
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.self_attn_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        self.gnn_W_in = nn.Linear(d_model, d_model, bias=False)
+        self.gnn_W_out = nn.Linear(d_model, d_model, bias=False)
+        self.gnn_W_z = nn.Linear(d_model, d_model)
+        self.gnn_U_z = nn.Linear(d_model, d_model, bias=False)
+        self.gnn_W_r = nn.Linear(d_model, d_model)
+        self.gnn_U_r = nn.Linear(d_model, d_model, bias=False)
+        self.gnn_W_h = nn.Linear(d_model, d_model)
+        self.gnn_U_h = nn.Linear(d_model, d_model, bias=False)
+
+        self.gnn_steps = 1
+
+        self.gate_layer = nn.Linear(2 * d_model, d_model)
+        self.output_proj = nn.Linear(2 * d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def _build_graph(self, items, device):
+        uniq, inv = torch.unique(items, return_inverse=True)
+        n_nodes = uniq.size(0)
+        if n_nodes == 1:
+            A_in = torch.zeros(1, 1, device=device)
+            A_out = torch.zeros(1, 1, device=device)
+            return uniq, inv, A_in, A_out
+        A_in = torch.zeros(n_nodes, n_nodes, device=device)
+        A_out = torch.zeros(n_nodes, n_nodes, device=device)
+        src = inv[:-1]
+        dst = inv[1:]
+        A_in[dst, src] += 1.0
+        A_out[src, dst] += 1.0
+        row_in = A_in.sum(dim=1, keepdim=True) + 1e-8
+        row_out = A_out.sum(dim=1, keepdim=True) + 1e-8
+        A_in = A_in / row_in
+        A_out = A_out / row_out
+        return uniq, inv, A_in, A_out
+
+    def _gnn_propagation(self, h, A_in, A_out):
+        for _ in range(self.gnn_steps):
+            m_in = A_in @ self.gnn_W_in(h)
+            m_out = A_out @ self.gnn_W_out(h)
+            m = m_in + m_out
+            z = torch.sigmoid(self.gnn_W_z(m) + self.gnn_U_z(h))
+            r = torch.sigmoid(self.gnn_W_r(m) + self.gnn_U_r(h))
+            h_tilde = torch.tanh(self.gnn_W_h(m) + self.gnn_U_h(r * h))
+            h = (1.0 - z) * h + z * h_tilde
+        return self.dropout(h)
+
+    def forward(self, seq, return_session_rep=False):
+        device = seq.device
+        B, L = seq.size()
+        positions = torch.arange(L, dtype=torch.long, device=device).unsqueeze(0)
+        item_emb_seq = self.item_emb(seq)
+        pos_emb_seq = self.pos_emb(positions)
+        x_global = item_emb_seq + pos_emb_seq
+        x_global = self.dropout(self.layer_norm(x_global))
+        global_out = self.self_attn_encoder(x_global)
+
+        session_reps = []
+        hidden_for_calib = []
+
+        for b in range(B):
+            s = seq[b]
+            items = s[s > 0]
+            if items.numel() == 0:
+                rep = torch.zeros(self.d_model, device=device)
+                session_reps.append(rep)
+                hidden_for_calib.append(rep.view(1, 1, -1).repeat(1, L, 1))
+                continue
+            uniq, inv, A_in, A_out = self._build_graph(items, device)
+            node_emb = self.item_emb(uniq)
+            h_local_nodes = self._gnn_propagation(node_emb, A_in, A_out)
+            h_local_seq = h_local_nodes[inv]
+            h_global_seq = global_out[b, : items.size(0), :]
+            pad_len = L - items.size(0)
+            if pad_len > 0:
+                pad_local = torch.zeros(pad_len, self.d_model, device=device)
+                pad_global = torch.zeros(pad_len, self.d_model, device=device)
+                h_local_seq = torch.cat([pad_local, h_local_seq], dim=0)
+                h_global_seq = torch.cat([pad_global, h_global_seq], dim=0)
+            h_local_seq = h_local_seq[-L:, :]
+            h_global_seq = h_global_seq[-L:, :]
+
+            gate_input = torch.cat([h_local_seq, h_global_seq], dim=-1)
+            gate = torch.sigmoid(self.gate_layer(gate_input))
+            h_comb = gate * h_local_seq + (1.0 - gate) * h_global_seq
+
+            mask = (s > 0).float()
+            last_idx = (mask.sum() - 1).long().clamp(min=0)
+            last_h = h_comb[last_idx]
+
+            att_scores = torch.matmul(h_comb, last_h)
+            att_scores = att_scores + (mask - 1.0) * 1e9
+            alpha = torch.softmax(att_scores, dim=0)
+            s_g = (alpha.unsqueeze(-1) * h_comb).sum(dim=0)
+            s_cat = torch.cat([s_g, last_h], dim=-1)
+            s_rep = self.output_proj(s_cat)
+            session_reps.append(s_rep)
+            hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
+
+        session_batch = torch.stack(session_reps, dim=0)
+        logits = session_batch @ self.item_emb.weight.t()
         if return_session_rep:
-            logits, z_US = out
+            hidden_batch = torch.cat(hidden_for_calib, dim=0)
+            z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
             return logits, z_US
-        else:
-            logits = out
-            return logits
+        return logits
+
+    def predict_next(self, seq, return_session_rep=False):
+        out = self.forward(seq, return_session_rep=return_session_rep)
+        return out
 
 
-class SRGNN(SimpleSessionGNN):
-    def __init__(self, num_items, d_model=128, dropout=0.2):
-        super().__init__(num_items, d_model=d_model, dropout=dropout, readout_type="last")
+class GCEGNN(BaseCalibratedModel):
+    def __init__(
+        self,
+        num_items,
+        max_len=50,
+        d_model=128,
+        dropout=0.2,
+        num_steps_local=1,
+        num_steps_global=1,
+    ):
+        nn.Module.__init__(self)
+        BaseCalibratedModel.__init__(self, d_model)
+        self.num_items = num_items
+        self.max_len = max_len
+        self.d_model = d_model
+        self.num_steps_local = num_steps_local
+        self.num_steps_global = num_steps_global
+
+        self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
+        nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.item_emb.weight[0].zero_()
+
+        self.local_W_in = nn.Linear(d_model, d_model, bias=False)
+        self.local_W_out = nn.Linear(d_model, d_model, bias=False)
+        self.local_W_z = nn.Linear(d_model, d_model)
+        self.local_U_z = nn.Linear(d_model, d_model, bias=False)
+        self.local_W_r = nn.Linear(d_model, d_model)
+        self.local_U_r = nn.Linear(d_model, d_model, bias=False)
+        self.local_W_h = nn.Linear(d_model, d_model)
+        self.local_U_h = nn.Linear(d_model, d_model, bias=False)
+
+        self.global_W = nn.Linear(d_model, d_model)
+        self.global_gate = nn.Linear(2 * d_model, d_model)
+        self.session_proj = nn.Linear(2 * d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def _build_local_graph(self, items, device):
+        uniq, inv = torch.unique(items, return_inverse=True)
+        n_nodes = uniq.size(0)
+        if n_nodes == 1:
+            A_in = torch.zeros(1, 1, device=device)
+            A_out = torch.zeros(1, 1, device=device)
+            return uniq, inv, A_in, A_out
+        A_in = torch.zeros(n_nodes, n_nodes, device=device)
+        A_out = torch.zeros(n_nodes, n_nodes, device=device)
+        src = inv[:-1]
+        dst = inv[1:]
+        A_in[dst, src] += 1.0
+        A_out[src, dst] += 1.0
+        row_in = A_in.sum(dim=1, keepdim=True) + 1e-8
+        row_out = A_out.sum(dim=1, keepdim=True) + 1e-8
+        A_in = A_in / row_in
+        A_out = A_out / row_out
+        return uniq, inv, A_in, A_out
+
+    def _local_gnn(self, h, A_in, A_out):
+        for _ in range(self.num_steps_local):
+            m_in = A_in @ self.local_W_in(h)
+            m_out = A_out @ self.local_W_out(h)
+            m = m_in + m_out
+            z = torch.sigmoid(self.local_W_z(m) + self.local_U_z(h))
+            r = torch.sigmoid(self.local_W_r(m) + self.local_U_r(h))
+            h_tilde = torch.tanh(self.local_W_h(m) + self.local_U_h(r * h))
+            h = (1.0 - z) * h + z * h_tilde
+        return self.dropout(h)
+
+    def _global_episode_gnn(self, h):
+        n_nodes = h.size(0)
+        if n_nodes <= 1:
+            return h
+        A = torch.ones(n_nodes, n_nodes, device=h.device) - torch.eye(n_nodes, device=h.device)
+        A = A / (A.sum(dim=1, keepdim=True) + 1e-8)
+        z = A @ self.global_W(h)
+        for _ in range(self.num_steps_global - 1):
+            z = A @ self.global_W(z)
+        return self.dropout(z)
+
+    def forward(self, seq, return_session_rep=False):
+        device = seq.device
+        B, L = seq.size()
+        session_reps = []
+        hidden_for_calib = []
+
+        for b in range(B):
+            s = seq[b]
+            items = s[s > 0]
+            if items.numel() == 0:
+                rep = torch.zeros(self.d_model, device=device)
+                session_reps.append(rep)
+                hidden_for_calib.append(rep.view(1, 1, -1).repeat(1, L, 1))
+                continue
+            uniq, inv, A_in, A_out = self._build_local_graph(items, device)
+            base_emb = self.item_emb(uniq)
+
+            h_local_nodes = self._local_gnn(base_emb, A_in, A_out)
+            h_global_nodes = self._global_episode_gnn(base_emb)
+
+            h_local_seq = h_local_nodes[inv]
+            h_global_seq = h_global_nodes[inv]
+
+            gate_input = torch.cat([h_local_seq, h_global_seq], dim=-1)
+            gate = torch.sigmoid(self.global_gate(gate_input))
+            h_seq = gate * h_local_seq + (1.0 - gate) * h_global_seq
+
+            mask = (s > 0).float()
+            last_idx = (mask.sum() - 1).long().clamp(min=0)
+            last_h = h_seq[last_idx]
+            att_scores = torch.matmul(h_seq, last_h)
+            alpha = torch.softmax(att_scores, dim=0)
+            s_g = (alpha.unsqueeze(-1) * h_seq).sum(dim=0)
+
+            s_cat = torch.cat([s_g, last_h], dim=-1)
+            s_rep = self.session_proj(s_cat)
+            session_reps.append(s_rep)
+            hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
+
+        session_batch = torch.stack(session_reps, dim=0)
+        logits = session_batch @ self.item_emb.weight.t()
+        if return_session_rep:
+            hidden_batch = torch.cat(hidden_for_calib, dim=0)
+            z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
+            return logits, z_US
+        return logits
+
+    def predict_next(self, seq, return_session_rep=False):
+        out = self.forward(seq, return_session_rep=return_session_rep)
+        return out
 
 
-class GCSAN(SimpleSessionGNN):
-    def __init__(self, num_items, d_model=128, dropout=0.2):
-        super().__init__(num_items, d_model=d_model, dropout=dropout, readout_type="mean")
+class TAGNN(BaseCalibratedModel):
+    def __init__(
+        self,
+        num_items,
+        d_model=128,
+        dropout=0.2,
+        num_steps=1,
+    ):
+        nn.Module.__init__(self)
+        BaseCalibratedModel.__init__(self, d_model)
+        self.num_items = num_items
+        self.d_model = d_model
+        self.num_steps = num_steps
 
+        self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
+        nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.item_emb.weight[0].zero_()
 
-class GCEGNN(SimpleSessionGNN):
-    def __init__(self, num_items, d_model=128, dropout=0.2):
-        super().__init__(num_items, d_model=d_model, dropout=dropout, readout_type="mean")
+        self.W_in = nn.Linear(d_model, d_model, bias=False)
+        self.W_out = nn.Linear(d_model, d_model, bias=False)
+        self.W_z = nn.Linear(d_model, d_model)
+        self.U_z = nn.Linear(d_model, d_model, bias=False)
+        self.W_r = nn.Linear(d_model, d_model)
+        self.U_r = nn.Linear(d_model, d_model, bias=False)
+        self.W_h = nn.Linear(d_model, d_model)
+        self.U_h = nn.Linear(d_model, d_model, bias=False)
 
+        self.att_W_t = nn.Linear(d_model, d_model)
+        self.att_W_s = nn.Linear(d_model, d_model)
+        self.att_q = nn.Parameter(torch.randn(d_model))
 
-class TAGNN(SimpleSessionGNN):
-    def __init__(self, num_items, d_model=128, dropout=0.2):
-        super().__init__(num_items, d_model=d_model, dropout=dropout, readout_type="attn")
+        self.session_proj = nn.Linear(2 * d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def _build_graph(self, items, device):
+        uniq, inv = torch.unique(items, return_inverse=True)
+        n_nodes = uniq.size(0)
+        if n_nodes == 1:
+            A_in = torch.zeros(1, 1, device=device)
+            A_out = torch.zeros(1, 1, device=device)
+            return uniq, inv, A_in, A_out
+        A_in = torch.zeros(n_nodes, n_nodes, device=device)
+        A_out = torch.zeros(n_nodes, n_nodes, device=device)
+        src = inv[:-1]
+        dst = inv[1:]
+        A_in[dst, src] += 1.0
+        A_out[src, dst] += 1.0
+        row_in = A_in.sum(dim=1, keepdim=True) + 1e-8
+        row_out = A_out.sum(dim=1, keepdim=True) + 1e-8
+        A_in = A_in / row_in
+        A_out = A_out / row_out
+        return uniq, inv, A_in, A_out
+
+    def _gnn_propagation(self, h, A_in, A_out):
+        for _ in range(self.num_steps):
+            m_in = A_in @ self.W_in(h)
+            m_out = A_out @ self.W_out(h)
+            m = m_in + m_out
+            z = torch.sigmoid(self.W_z(m) + self.U_z(h))
+            r = torch.sigmoid(self.W_r(m) + self.U_r(h))
+            h_tilde = torch.tanh(self.W_h(m) + self.U_h(r * h))
+            h = (1.0 - z) * h + z * h_tilde
+        return self.dropout(h)
+
+    def forward(self, seq, return_session_rep=False):
+        device = seq.device
+        B, L = seq.size()
+        session_reps = []
+        hidden_for_calib = []
+
+        for b in range(B):
+            s = seq[b]
+            items = s[s > 0]
+            if items.numel() == 0:
+                rep = torch.zeros(self.d_model, device=device)
+                session_reps.append(rep)
+                hidden_for_calib.append(rep.view(1, 1, -1).repeat(1, L, 1))
+                continue
+
+            uniq, inv, A_in, A_out = self._build_graph(items, device)
+            node_emb = self.item_emb(uniq)
+            h_nodes = self._gnn_propagation(node_emb, A_in, A_out)
+            h_seq = h_nodes[inv]
+
+            last_idx = len(items) - 1
+            h_last = h_seq[last_idx]
+
+            att_in = self.att_W_t(h_last).unsqueeze(0) + self.att_W_s(h_seq)
+            e = torch.tanh(att_in)
+            alpha = torch.softmax(e @ self.att_q, dim=0)
+            s_t = (alpha.unsqueeze(-1) * h_seq).sum(dim=0)
+
+            s_cat = torch.cat([s_t, h_last], dim=-1)
+            s_rep = self.session_proj(s_cat)
+
+            session_reps.append(s_rep)
+            hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
+
+        session_batch = torch.stack(session_reps, dim=0)
+        logits = session_batch @ self.item_emb.weight.t()
+        if return_session_rep:
+            hidden_batch = torch.cat(hidden_for_calib, dim=0)
+            z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
+            return logits, z_US
+        return logits
+
+    def predict_next(self, seq, return_session_rep=False):
+        out = self.forward(seq, return_session_rep=return_session_rep)
+        return out
+
 
 
 class SelfGNN(BaseCalibratedModel):
@@ -812,9 +1193,11 @@ def build_model(model_name, num_items, max_len=50, d_model=128, n_heads=2, n_lay
     elif model_name == "srgnn":
         return SRGNN(num_items=num_items, d_model=d_model, dropout=dropout)
     elif model_name == "gcsan":
-        return GCSAN(num_items=num_items, d_model=d_model, dropout=dropout)
+        return GCSAN(num_items=num_items, max_len=max_len, d_model=d_model,
+                     n_heads=n_heads, n_layers=1, dropout=dropout)
     elif model_name == "gce-gnn" or model_name == "gcegnn":
-        return GCEGNN(num_items=num_items, d_model=d_model, dropout=dropout)
+        return GCEGNN(num_items=num_items, max_len=max_len, d_model=d_model,
+                      dropout=dropout)
     elif model_name == "tagnn":
         return TAGNN(num_items=num_items, d_model=d_model, dropout=dropout)
     elif model_name == "selfgnn":
