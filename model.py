@@ -753,6 +753,7 @@ class GCSAN(BaseCalibratedModel):
     def forward(self, seq, return_session_rep=False):
         device = seq.device
         B, L = seq.size()
+
         positions = torch.arange(L, dtype=torch.long, device=device).unsqueeze(0)
         item_emb_seq = self.item_emb(seq)
         pos_emb_seq = self.pos_emb(positions)
@@ -765,54 +766,61 @@ class GCSAN(BaseCalibratedModel):
 
         for b in range(B):
             s = seq[b]
-            items = s[s > 0]
-            if items.numel() == 0:
+            nonpad_idx = (s > 0).nonzero(as_tuple=False).squeeze(-1)
+
+            if nonpad_idx.numel() == 0:
                 rep = torch.zeros(self.d_model, device=device)
                 session_reps.append(rep)
                 hidden_for_calib.append(rep.view(1, 1, -1).repeat(1, L, 1))
                 continue
+
+            items = s[nonpad_idx]
+
             uniq, inv, A_in, A_out = self._build_graph(items, device)
             node_emb = self.item_emb(uniq)
             h_local_nodes = self._gnn_propagation(node_emb, A_in, A_out)
             h_local_seq = h_local_nodes[inv]
-            h_global_seq = global_out[b, : items.size(0), :]
-            pad_len = L - items.size(0)
-            if pad_len > 0:
-                pad_local = torch.zeros(pad_len, self.d_model, device=device)
-                pad_global = torch.zeros(pad_len, self.d_model, device=device)
-                h_local_seq = torch.cat([pad_local, h_local_seq], dim=0)
-                h_global_seq = torch.cat([pad_global, h_global_seq], dim=0)
-            h_local_seq = h_local_seq[-L:, :]
-            h_global_seq = h_global_seq[-L:, :]
 
-            gate_input = torch.cat([h_local_seq, h_global_seq], dim=-1)
+            h_global_seq = global_out[b, nonpad_idx, :]
+
+            h_local_full = torch.zeros(L, self.d_model, device=device)
+            h_global_full = torch.zeros(L, self.d_model, device=device)
+            h_local_full[nonpad_idx] = h_local_seq
+            h_global_full[nonpad_idx] = h_global_seq
+
+            gate_input = torch.cat([h_local_full, h_global_full], dim=-1)
             gate = torch.sigmoid(self.gate_layer(gate_input))
-            h_comb = gate * h_local_seq + (1.0 - gate) * h_global_seq
+            h_comb = gate * h_local_full + (1.0 - gate) * h_global_full
 
-            mask = (s > 0).float()
-            last_idx = (mask.sum() - 1).long().clamp(min=0)
+            last_idx = nonpad_idx[-1].item()
             last_h = h_comb[last_idx]
 
+            mask = (s > 0).float()
             att_scores = torch.matmul(h_comb, last_h)
             att_scores = att_scores + (mask - 1.0) * 1e9
             alpha = torch.softmax(att_scores, dim=0)
             s_g = (alpha.unsqueeze(-1) * h_comb).sum(dim=0)
+
             s_cat = torch.cat([s_g, last_h], dim=-1)
             s_rep = self.output_proj(s_cat)
+
             session_reps.append(s_rep)
             hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
 
         session_batch = torch.stack(session_reps, dim=0)
         logits = session_batch @ self.item_emb.weight.t()
+
         if return_session_rep:
             hidden_batch = torch.cat(hidden_for_calib, dim=0)
             z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
             return logits, z_US
+
         return logits
 
     def predict_next(self, seq, return_session_rep=False):
         out = self.forward(seq, return_session_rep=return_session_rep)
         return out
+
 
 
 class GCEGNN(BaseCalibratedModel):
