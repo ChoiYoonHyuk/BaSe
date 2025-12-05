@@ -1371,7 +1371,9 @@ def train_model(
 
     if mode == 2:
         eps = 1e-8
-        pop = torch.tensor(item_pop, dtype=torch.float)
+        pop = torch.zeros(num_items + 1, dtype=torch.float)
+        for t in train_tgts:
+            pop[t] += 1.0
         pop[0] = 0.0
         pop[1:] = pop[1:] + 1e-3
         q_pop = pop.pow(0.75)
@@ -1381,22 +1383,30 @@ def train_model(
         q_pop[0] = eps
 
         mu = torch.zeros_like(q_pop)
+        seen_mask = (pop > 0).float()
         if num_items > 0:
-            mu[1:] = 1.0 / num_items
+            seen_count = seen_mask[1:].sum()
+            if seen_count > 0:
+                mu[1:] = seen_mask[1:] / seen_count
+            else:
+                mu[1:] = 1.0 / num_items
 
         log_q = torch.log(q_pop + eps)
 
         omega = mu / (q_pop + eps)
+        omega[0] = 0.0
         omega_sum = omega[1:].sum() + eps
         w_tilde = omega / omega_sum
 
         log_q = log_q.to(device)
         w_tilde = w_tilde.to(device)
         mu = mu.to(device)
+        iw_clip = 10.0
     else:
         log_q = None
         w_tilde = None
         mu = None
+        iw_clip = None
 
     srt_q = None
     srt_log_q = None
@@ -1448,11 +1458,19 @@ def train_model(
                 loss = F.cross_entropy(logits_cand, labels)
 
             elif mode == 2:
-                logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
-                logits = torch.clamp(logits, -20.0, 20.0)
+                if model_name.lower() == "duorec":
+                    logits, z_US, z_proj = model.predict_next(seq_batch, return_session_rep=True, return_proj=True)
+                    rep_for_alpha = z_proj
+                else:
+                    logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
+                    rep_for_alpha = z_US
+
                 B, _ = logits.size()
 
-                alpha_vec = F.softplus(model.alpha_layer(z_US)).view(B, 1)
+                alpha_vec = F.softplus(model.alpha_layer(rep_for_alpha)).view(B, 1)
+                if model_name.lower() == "duorec":
+                    alpha_vec = 0.5 * alpha_vec
+
                 tilde_s = logits - alpha_vec * log_q.unsqueeze(0)
                 tilde_s = torch.clamp(tilde_s, -20.0, 20.0)
 
@@ -1462,6 +1480,8 @@ def train_model(
 
                 iw = w_tilde[tgt_batch]
                 iw = torch.where(tgt_batch > 0, iw, torch.zeros_like(iw))
+                if iw_clip is not None:
+                    iw = torch.clamp(iw, max=iw_clip)
 
                 loss_iw_ce = - (iw * log_p_y).sum() / (iw.sum() + 1e-8)
 
@@ -1480,12 +1500,16 @@ def train_model(
 
                 l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
 
+                cal_weight = lambda_cal
+                if model_name.lower() == "duorec":
+                    cal_weight = lambda_cal * 0.5
+
                 l2_reg = torch.tensor(0.0, device=device)
                 if lambda_l2 > 0.0:
                     for param in model.parameters():
                         l2_reg = l2_reg + param.pow(2).sum()
 
-                loss = loss_iw_ce + lambda_cal * l_cal + lambda_l2 * l2_reg
+                loss = loss_iw_ce + cal_weight * l_cal + lambda_l2 * l2_reg
 
             elif mode == 1:
                 logits = model.predict_next(seq_batch)
@@ -1563,6 +1587,7 @@ def train_model(
     print(f"[{model_name}] Final Test HR@{k_eval} = {test_hr:.4f} | Test NDCG@{k_eval} = {test_ndcg:.4f}")
 
     return model, item2id, id2item
+
 
 
 def parse_args():
