@@ -12,10 +12,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
-# ======================
-# Data utils
-# ======================
-
 def filter_5core(df, user_col, item_col, min_cnt=5):
     while True:
         before = len(df)
@@ -162,10 +158,6 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx):
         return self.sequences[idx], self.targets[idx]
 
-
-# ======================
-# Models
-# ======================
 
 class BaseCalibratedModel(nn.Module):
     def __init__(self, d_model):
@@ -442,6 +434,79 @@ class CORE(BaseCalibratedModel):
         n_heads=2,
         n_layers=2,
         dropout=0.2,
+        temperature=1.0,
+    ):
+        nn.Module.__init__(self)
+        BaseCalibratedModel.__init__(self, d_model)
+
+        self.num_items = num_items
+        self.max_len = max_len
+        self.d_model = d_model
+
+        self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
+        nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.item_emb.weight[0].zero_()
+
+        self.sess_dropout = nn.Dropout(dropout)
+        self.item_dropout = nn.Dropout(dropout)
+
+        self.temperature = temperature
+
+    def _compute_alpha(self, seq):
+        mask = (seq > 0).float()          # (B, L)
+        denom = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        alpha = mask / denom              # (B, L)
+        return alpha.unsqueeze(-1)        # (B, L, 1)
+
+    def forward(self, seq, return_session_rep=False):
+        B, L = seq.size()
+        x = self.item_emb(seq)           # (B, L, D)
+        x = self.sess_dropout(x)
+
+        alpha = self._compute_alpha(seq) # (B, L, 1)
+        seq_output = torch.sum(alpha * x, dim=1)  # (B, D)
+        seq_output = F.normalize(seq_output, dim=-1)
+
+        if return_session_rep:
+            hidden_states = seq_output.unsqueeze(1).expand(B, L, self.d_model)
+            z_US = self.compute_session_rep_from_hidden(seq, hidden_states)
+            return seq_output, z_US
+
+        return seq_output
+
+    def predict_next(self, seq, return_session_rep=False):
+        out = self.forward(seq, return_session_rep=return_session_rep)
+        if return_session_rep:
+            seq_output, z_US = out
+        else:
+            seq_output = out
+            z_US = None
+    
+        item_emb = self.item_emb.weight  # (num_items+1, d_model)
+    
+        if self.training:
+            item_emb = self.item_dropout(item_emb)
+    
+        item_emb = F.normalize(item_emb, dim=-1)
+    
+        logits = torch.matmul(seq_output, item_emb.t()) / self.temperature  # (B, N+1)
+    
+        if return_session_rep:
+            return logits, z_US
+        return logits
+
+
+
+class SRT(BaseCalibratedModel):
+    def __init__(
+        self,
+        num_items,
+        max_len=50,
+        d_model=128,
+        n_heads=2,
+        n_layers=2,
+        dropout=0.2,
     ):
         nn.Module.__init__(self)
         BaseCalibratedModel.__init__(self, d_model)
@@ -467,9 +532,8 @@ class CORE(BaseCalibratedModel):
 
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model)
-        self.fc_out = nn.Linear(d_model, num_items + 1)
 
-    def forward(self, seq, return_session_rep=False):
+    def _encode(self, seq):
         device = seq.device
         B, L = seq.size()
         item_emb = self.item_emb(seq)
@@ -479,22 +543,32 @@ class CORE(BaseCalibratedModel):
         x = self.dropout(x)
         x = self.layer_norm(x)
         x = self.encoder(x)
-        logits = self.fc_out(x)
+        return x
+
+    def _last_hidden(self, seq, hidden_states):
+        device = seq.device
+        mask = (seq > 0).float()
+        lengths = mask.sum(dim=1).long().clamp(min=1) - 1
+        idx = torch.arange(seq.size(0), device=device)
+        h_last = hidden_states[idx, lengths]
+        return h_last
+
+    def get_seq_rep(self, seq):
+        x = self._encode(seq)
+        h_last = self._last_hidden(seq, x)
+        return h_last
+
+    def forward(self, seq, return_session_rep=False):
+        x = self._encode(seq)
+        h_last = self._last_hidden(seq, x)
+        logits = torch.matmul(h_last, self.item_emb.weight.t())
         if return_session_rep:
             z_US = self.compute_session_rep_from_hidden(seq, x)
             return logits, z_US
         return logits
 
     def predict_next(self, seq, return_session_rep=False):
-        out = self.forward(seq, return_session_rep=return_session_rep)
-        if return_session_rep:
-            logits, z_US = out
-            last_logits = logits[:, -1, :]
-            return last_logits, z_US
-        else:
-            logits = out
-            last_logits = logits[:, -1, :]
-            return last_logits
+        return self.forward(seq, return_session_rep=return_session_rep)
 
 
 class SimpleSessionGNN(BaseCalibratedModel):
@@ -604,6 +678,120 @@ class TAGNN(SimpleSessionGNN):
         super().__init__(num_items, d_model=d_model, dropout=dropout, readout_type="attn")
 
 
+class SelfGNN(BaseCalibratedModel):
+    def __init__(
+        self,
+        num_items,
+        max_len=50,
+        d_model=128,
+        n_heads=2,
+        n_layers=1,
+        dropout=0.2,
+        n_gnn_layers=1,
+    ):
+        nn.Module.__init__(self)
+        BaseCalibratedModel.__init__(self, d_model)
+        self.num_items = num_items
+        self.max_len = max_len
+        self.d_model = d_model
+        self.n_gnn_layers = n_gnn_layers
+
+        self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+
+        nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.item_emb.weight[0].zero_()
+
+        self.gnn_dropout = nn.Dropout(dropout)
+
+        self.gru = nn.GRU(d_model, d_model, batch_first=True)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.inst_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        self.fc_out = nn.Linear(d_model, num_items + 1)
+
+    def _build_adj_and_nodes(self, items, device):
+        uniq, inverse = torch.unique(items, return_inverse=True)
+        n_nodes = uniq.size(0)
+        if n_nodes == 1:
+            A = torch.zeros(n_nodes, n_nodes, device=device)
+        else:
+            src = inverse[:-1]
+            dst = inverse[1:]
+            A = torch.zeros(n_nodes, n_nodes, device=device)
+            A[src, dst] = 1.0
+
+        row_sum = A.sum(dim=1, keepdim=True) + 1e-8
+        A_norm = A / row_sum
+        return uniq, A_norm, inverse
+
+    def _short_term_gnn(self, seq):
+        device = seq.device
+        B, L = seq.size()
+        reps = []
+        for b in range(B):
+            s = seq[b]
+            items = s[s > 0]
+            if items.numel() == 0:
+                reps.append(torch.zeros(self.d_model, device=device))
+                continue
+            uniq, A_norm, inv = self._build_adj_and_nodes(items, device)
+            e = self.item_emb(uniq)
+            for _ in range(self.n_gnn_layers):
+                z = torch.matmul(A_norm, e)
+                z = F.leaky_relu(z)
+                e = z + e
+            e = self.gnn_dropout(e)
+            reps.append(e.mean(dim=0))
+        return torch.stack(reps, dim=0)
+
+    def _interval_and_instance(self, seq):
+        device = seq.device
+        B, L = seq.size()
+        item_e = self.item_emb(seq)
+        mask = (seq > 0).unsqueeze(-1).float()
+        item_e = item_e * mask
+
+        h_seq, _ = self.gru(item_e)
+
+        positions = torch.arange(L, dtype=torch.long, device=device).unsqueeze(0)
+        pos_emb = self.pos_emb(positions)
+        h_pos = h_seq + pos_emb
+
+        h_attn = self.inst_encoder(h_pos)
+
+        lengths = mask.sum(dim=1).clamp(min=1.0)
+        e_bar_u = (h_seq * mask).sum(dim=1) / lengths
+        e_tilde_u = (h_attn * mask).sum(dim=1) / lengths
+        return e_bar_u, e_tilde_u
+
+    def forward(self, seq, return_session_rep=False):
+        short_u = self._short_term_gnn(seq)
+        e_bar_u, e_tilde_u = self._interval_and_instance(seq)
+        e_hat_u = short_u + e_bar_u + e_tilde_u
+
+        logits = torch.matmul(e_hat_u, self.item_emb.weight.t())
+
+        if return_session_rep:
+            B, L = seq.size()
+            hidden = e_hat_u.view(B, 1, -1).repeat(1, L, 1)
+            z_US = self.compute_session_rep_from_hidden(seq, hidden)
+            return logits, z_US
+        return logits
+
+    def predict_next(self, seq, return_session_rep=False):
+        return self.forward(seq, return_session_rep=return_session_rep)
+
+
 def build_model(model_name, num_items, max_len=50, d_model=128, n_heads=2, n_layers=2, dropout=0.2):
     model_name = model_name.lower()
     if model_name == "sasrec":
@@ -618,6 +806,9 @@ def build_model(model_name, num_items, max_len=50, d_model=128, n_heads=2, n_lay
     elif model_name == "core":
         return CORE(num_items=num_items, max_len=max_len, d_model=d_model,
                     n_heads=n_heads, n_layers=n_layers, dropout=dropout)
+    elif model_name == "srt":
+        return SRT(num_items=num_items, max_len=max_len, d_model=d_model,
+                   n_heads=n_heads, n_layers=n_layers, dropout=dropout)
     elif model_name == "srgnn":
         return SRGNN(num_items=num_items, d_model=d_model, dropout=dropout)
     elif model_name == "gcsan":
@@ -626,13 +817,12 @@ def build_model(model_name, num_items, max_len=50, d_model=128, n_heads=2, n_lay
         return GCEGNN(num_items=num_items, d_model=d_model, dropout=dropout)
     elif model_name == "tagnn":
         return TAGNN(num_items=num_items, d_model=d_model, dropout=dropout)
+    elif model_name == "selfgnn":
+        return SelfGNN(num_items=num_items, max_len=max_len, d_model=d_model,
+                       n_heads=n_heads, n_layers=1, dropout=dropout, n_gnn_layers=1)
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 
-
-# ======================
-# Evaluation
-# ======================
 
 def evaluate_hr_ndcg(model, data_loader, device, k=20):
     model.eval()
@@ -673,7 +863,7 @@ def evaluate_hr_ndcg_neg_sampling(model, data_loader, device, num_items, k=20, n
             tgt_batch = tgt_batch.to(device)
             B, L = seq_batch.size()
 
-            logits_all = model.predict_next(seq_batch)  # (B, num_items+1)
+            logits_all = model.predict_next(seq_batch)
 
             for i in range(B):
                 target = tgt_batch[i].item()
@@ -708,10 +898,6 @@ def evaluate_hr_ndcg_neg_sampling(model, data_loader, device, num_items, k=20, n
     ndcg = total_ndcg / total
     return hr, ndcg
 
-
-# ======================
-# Training
-# ======================
 
 def train_model(
     model_name="sasrec",
@@ -824,6 +1010,25 @@ def train_model(
         log_q = log_q.to(device)
         w_tilde = w_tilde.to(device)
         mu = mu.to(device)
+    else:
+        log_q = None
+        w_tilde = None
+        mu = None
+
+    srt_q = None
+    srt_log_q = None
+    srt_num_neg = 100
+    srt_tau = 1.0
+    if model_name.lower() == "srt":
+        eps = 1e-8
+        pop = torch.tensor(item_pop, dtype=torch.float)
+        pop[0] = 0.0
+        if pop[1:].sum() <= 0:
+            pop[1:] = 1.0
+        pop = pop / (pop.sum() + eps)
+        pop[0] = eps
+        srt_q = pop.to(device)
+        srt_log_q = torch.log(srt_q + eps).to(device)
 
     best_val_ndcg = 0.0
     best_state = None
@@ -839,7 +1044,27 @@ def train_model(
 
             optimizer.zero_grad()
 
-            if mode == 2:
+            if model_name.lower() == "srt":
+                B = seq_batch.size(0)
+                seq_rep = model.get_seq_rep(seq_batch)
+
+                with torch.no_grad():
+                    neg_ids = torch.multinomial(srt_q[1:], B * srt_num_neg, replacement=True) + 1
+                neg_ids = neg_ids.view(B, srt_num_neg).to(device)
+
+                pos_ids = tgt_batch
+                pos_emb = model.item_emb(pos_ids)
+                neg_emb = model.item_emb(neg_ids)
+
+                pos_logits = (seq_rep * pos_emb).sum(dim=-1) / srt_tau - srt_log_q[pos_ids]
+                neg_logits = (seq_rep.unsqueeze(1) * neg_emb).sum(dim=-1) / srt_tau - srt_log_q[neg_ids]
+
+                logits_cand = torch.cat([pos_logits.unsqueeze(1), neg_logits], dim=1)
+                labels = torch.zeros(B, dtype=torch.long, device=device)
+
+                loss = F.cross_entropy(logits_cand, labels)
+
+            elif mode == 2:
                 logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                 logits = torch.clamp(logits, -20.0, 20.0)
                 B, _ = logits.size()
@@ -957,10 +1182,6 @@ def train_model(
     return model, item2id, id2item
 
 
-# ======================
-# Main
-# ======================
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -973,7 +1194,8 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["sasrec", "bert4rec", "duorec", "core", "srgnn", "gcsan", "gce-gnn", "tagnn"],
+        choices=["sasrec", "bert4rec", "duorec", "core", "srt", 
+                 "srgnn", "gcsan", "gce-gnn", "tagnn", "selfgnn"],
         default="sasrec",
         help="Baseline model",
     )
