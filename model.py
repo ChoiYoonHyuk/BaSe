@@ -1439,23 +1439,80 @@ def train_model(
 
             if model_name.lower() == "srt":
                 B = seq_batch.size(0)
-                seq_rep = model.get_seq_rep(seq_batch)
 
-                with torch.no_grad():
-                    neg_ids = torch.multinomial(srt_q[1:], B * srt_num_neg, replacement=True) + 1
-                neg_ids = neg_ids.view(B, srt_num_neg).to(device)
+                if mode in (0, 1):
+                    seq_rep = model.get_seq_rep(seq_batch)
 
-                pos_ids = tgt_batch
-                pos_emb = model.item_emb(pos_ids)
-                neg_emb = model.item_emb(neg_ids)
+                    with torch.no_grad():
+                        neg_ids = torch.multinomial(srt_q[1:], B * srt_num_neg, replacement=True) + 1
+                    neg_ids = neg_ids.view(B, srt_num_neg).to(device)
 
-                pos_logits = (seq_rep * pos_emb).sum(dim=-1) / srt_tau - srt_log_q[pos_ids]
-                neg_logits = (seq_rep.unsqueeze(1) * neg_emb).sum(dim=-1) / srt_tau - srt_log_q[neg_ids]
+                    pos_ids = tgt_batch
+                    pos_emb = model.item_emb(pos_ids)
+                    neg_emb = model.item_emb(neg_ids)
 
-                logits_cand = torch.cat([pos_logits.unsqueeze(1), neg_logits], dim=1)
-                labels = torch.zeros(B, dtype=torch.long, device=device)
+                    pos_logits = (seq_rep * pos_emb).sum(dim=-1) / srt_tau - srt_log_q[pos_ids]
+                    neg_logits = (seq_rep.unsqueeze(1) * neg_emb).sum(dim=-1) / srt_tau - srt_log_q[neg_ids]
 
-                loss = F.cross_entropy(logits_cand, labels)
+                    logits_cand = torch.cat([pos_logits.unsqueeze(1), neg_logits], dim=1)
+                    labels = torch.zeros(B, dtype=torch.long, device=device)
+
+                    if mode == 0:
+                        loss = F.cross_entropy(logits_cand, labels)
+
+                    else:
+                        ce = F.cross_entropy(logits_cand, labels, reduction="none")
+                        p_tgt = propensity[pos_ids]
+                        iw = 1.0 / (p_tgt + 1e-8)
+                        iw = torch.where(pos_ids > 0, iw, torch.zeros_like(iw))
+                        loss = (ce * iw).sum() / (iw.sum() + 1e-8)
+
+                elif mode == 2:
+                    logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
+                    B, _ = logits.size()
+
+                    alpha_vec = F.softplus(model.alpha_layer(z_US)).view(B, 1) * 0.1
+
+                    tilde_s = logits - alpha_vec * log_q.unsqueeze(0)
+                    tilde_s = torch.clamp(tilde_s, -20.0, 20.0)
+
+                    log_probs = F.log_softmax(tilde_s, dim=1)
+                    batch_idx = torch.arange(B, device=device)
+                    log_p_y = log_probs[batch_idx, tgt_batch]
+
+                    iw = w_tilde[tgt_batch]
+                    iw = torch.where(tgt_batch > 0, iw, torch.zeros_like(iw))
+                    if iw_clip is not None:
+                        iw = torch.clamp(iw, max=iw_clip)
+
+                    loss_iw_ce = - (iw * log_p_y).sum() / (iw.sum() + 1e-8)
+
+                    probs = F.softmax(tilde_s, dim=1)
+                    p_mean = probs.mean(dim=0)
+
+                    p_nonpad = p_mean[1:]
+                    mu_nonpad = mu[1:]
+
+                    p_nonpad = p_nonpad / (p_nonpad.sum() + 1e-8)
+                    mu_nonpad = mu_nonpad / (mu_nonpad.sum() + 1e-8)
+
+                    eps = 1e-8
+                    p_nonpad = p_nonpad + eps
+                    mu_nonpad = mu_nonpad + eps
+
+                    l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
+
+                    cal_weight = lambda_cal * 1e-3
+
+                    l2_reg = torch.tensor(0.0, device=device)
+                    if lambda_l2 > 0.0:
+                        for param in model.parameters():
+                            l2_reg = l2_reg + param.pow(2).sum()
+
+                    loss = loss_iw_ce + cal_weight * l_cal + lambda_l2 * l2_reg
+
+                else:
+                    raise ValueError("Unsupported mode for SRT")
 
             elif mode == 2:
                 if model_name.lower() == "duorec":
@@ -1471,13 +1528,13 @@ def train_model(
 
                 if model_name.lower() == "core":
                     logits = 5.0 * logits
-                    
+
                 B, _ = logits.size()
 
                 alpha_vec = F.softplus(model.alpha_layer(rep_for_alpha)).view(B, 1)
                 if model_name.lower() == "duorec":
                     alpha_vec = 0.01 * alpha_vec
-                if model_name.lower() == "core":
+                elif model_name.lower() == "core":
                     alpha_vec = torch.clamp(alpha_vec, max=0.5)
 
                 tilde_s = logits - alpha_vec * log_q.unsqueeze(0)
@@ -1510,7 +1567,7 @@ def train_model(
                 l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
 
                 cal_weight = lambda_cal
-                if model_name.lower() == "duorec" or "core":
+                if model_name.lower() in ("duorec", "core"):
                     cal_weight = lambda_cal * 0.3
 
                 l2_reg = torch.tensor(0.0, device=device)
