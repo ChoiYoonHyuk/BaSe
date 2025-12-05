@@ -351,15 +351,12 @@ class DuoRec(BaseCalibratedModel):
         BaseCalibratedModel.__init__(self, d_model)
         self.num_items = num_items
         self.max_len = max_len
-
         self.item_emb = nn.Embedding(num_items + 1, d_model, padding_idx=0)
         self.pos_emb = nn.Embedding(max_len, d_model)
-
         nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
         with torch.no_grad():
             self.item_emb.weight[0].zero_()
-
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
@@ -368,11 +365,9 @@ class DuoRec(BaseCalibratedModel):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model)
         self.fc_out = nn.Linear(d_model, num_items + 1)
-
         self.proj_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -395,16 +390,47 @@ class DuoRec(BaseCalibratedModel):
             return logits, z_US
         return logits
 
-    def predict_next(self, seq, return_session_rep=False):
-        out = self.forward(seq, return_session_rep=return_session_rep)
+    def get_seq_rep(self, seq):
+        device = seq.device
+        B, L = seq.size()
+        item_emb = self.item_emb(seq)
+        positions = torch.arange(L, dtype=torch.long, device=device).unsqueeze(0)
+        pos_emb = self.pos_emb(positions)
+        x = item_emb + pos_emb
+        x = self.dropout(x)
+        x = self.layer_norm(x)
+        x = self.encoder(x)
+        mask = (seq > 0).float()
+        lengths = mask.sum(dim=1).long().clamp(min=1) - 1
+        h_last = x[torch.arange(B, device=device), lengths]
+        z = self.proj_head(h_last)
+        return h_last, z
+
+    def predict_next(self, seq, return_session_rep=False, return_proj=False):
+        device = seq.device
+        B, L = seq.size()
+        item_emb = self.item_emb(seq)
+        positions = torch.arange(L, dtype=torch.long, device=device).unsqueeze(0)
+        pos_emb = self.pos_emb(positions)
+        x = item_emb + pos_emb
+        x = self.dropout(x)
+        x = self.layer_norm(x)
+        x = self.encoder(x)
+        logits = self.fc_out(x)
+        last_logits = logits[:, -1, :]
+        outputs = (last_logits,)
         if return_session_rep:
-            logits, z_US = out
-            last_logits = logits[:, -1, :]
-            return last_logits, z_US
-        else:
-            logits = out
-            last_logits = logits[:, -1, :]
-            return last_logits
+            z_US = self.compute_session_rep_from_hidden(seq, x)
+            outputs += (z_US,)
+        if return_proj:
+            mask = (seq > 0).float()
+            lengths = mask.sum(dim=1).long().clamp(min=1) - 1
+            h_last = x[torch.arange(B, device=device), lengths]
+            z = self.proj_head(h_last)
+            outputs += (z,)
+        if len(outputs) == 1:
+            return outputs[0]
+        return outputs
 
 
 class CORE(BaseCalibratedModel):
