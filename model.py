@@ -616,8 +616,6 @@ class SRGNN(BaseCalibratedModel):
         dst = inv[1:]
         A_in[dst, src] += 1.0
         A_out[src, dst] += 1.0
-        A_in += torch.eye(n_nodes, device=device) * 0.1
-        A_out += torch.eye(n_nodes, device=device) * 0.1
         row_in = A_in.sum(dim=1, keepdim=True) + 1e-8
         row_out = A_out.sum(dim=1, keepdim=True) + 1e-8
         A_in = A_in / row_in
