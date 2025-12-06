@@ -1589,11 +1589,10 @@ def train_model(
                 elif model_name.lower() == "gcegnn":
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
-                    logits = 3.0 * logits
                 elif model_name.lower() == "tagnn":
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
-                    logits = 5.0 * logits
+                    logits = 1.0 * logits
                 else:
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
@@ -1604,7 +1603,9 @@ def train_model(
                 
                 if model_name.lower() == "duorec":
                     alpha_vec = 0.01 * alpha_vec
-                elif model_name.lower() in ("core", "srgnn", "gcegnn", "gcsan", "selfgnn"):
+                elif model_name.lower() in ("core", "srgnn", "gcsan", "selfgnn"):
+                    alpha_vec = 0.5 * alpha_vec
+                elif model_name.lower() == "gcegnn":
                     alpha_vec = 0.5 * alpha_vec
                 elif model_name.lower() == "tagnn":
                     alpha_vec = 0.3 * alpha_vec
