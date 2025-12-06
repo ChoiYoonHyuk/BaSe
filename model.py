@@ -993,6 +993,7 @@ class TAGNN(BaseCalibratedModel):
     ):
         nn.Module.__init__(self)
         BaseCalibratedModel.__init__(self, d_model)
+
         self.num_items = num_items
         self.d_model = d_model
         self.num_steps = num_steps
@@ -1024,20 +1025,25 @@ class TAGNN(BaseCalibratedModel):
     def _build_graph(self, items, device):
         uniq, inv = torch.unique(items, return_inverse=True)
         n_nodes = uniq.size(0)
+
         if n_nodes == 1:
             A_in = torch.zeros(1, 1, device=device)
             A_out = torch.zeros(1, 1, device=device)
             return uniq, inv, A_in, A_out
+
         A_in = torch.zeros(n_nodes, n_nodes, device=device)
         A_out = torch.zeros(n_nodes, n_nodes, device=device)
+
         src = inv[:-1]
         dst = inv[1:]
         A_in[dst, src] += 1.0
         A_out[src, dst] += 1.0
+
         row_in = A_in.sum(dim=1, keepdim=True) + 1e-8
         row_out = A_out.sum(dim=1, keepdim=True) + 1e-8
         A_in = A_in / row_in
         A_out = A_out / row_out
+
         return uniq, inv, A_in, A_out
 
     def _gnn_propagation(self, h, A_in, A_out):
@@ -1045,35 +1051,42 @@ class TAGNN(BaseCalibratedModel):
             m_in = A_in @ self.W_in(h)
             m_out = A_out @ self.W_out(h)
             m = m_in + m_out
+
             z = torch.sigmoid(self.W_z(m) + self.U_z(h))
             r = torch.sigmoid(self.W_r(m) + self.U_r(h))
             h_tilde = torch.tanh(self.W_h(m) + self.U_h(r * h))
             h = (1.0 - z) * h + z * h_tilde
+
         return self.dropout(h)
 
     def forward(self, seq, return_session_rep=False):
         device = seq.device
         B, L = seq.size()
+
         session_reps = []
         hidden_for_calib = []
 
         for b in range(B):
             s = seq[b]
-            items = s[s > 0]
-            if items.numel() == 0:
+            nonpad_idx = (s > 0).nonzero(as_tuple=False).squeeze(-1)
+
+            if nonpad_idx.numel() == 0:
                 rep = torch.zeros(self.d_model, device=device)
                 session_reps.append(rep)
                 hidden_for_calib.append(rep.view(1, 1, -1).repeat(1, L, 1))
                 continue
 
+            items = s[nonpad_idx]
+
             uniq, inv, A_in, A_out = self._build_graph(items, device)
+
             node_emb = self.item_emb(uniq)
             node_emb = self.input_ln(node_emb)
 
             h_nodes = self._gnn_propagation(node_emb, A_in, A_out)
             h_seq = h_nodes[inv]
 
-            last_idx = len(items) - 1
+            last_idx = h_seq.size(0) - 1
             h_last = h_seq[last_idx]
 
             att_in = self.att_W_t(h_last).unsqueeze(0) + self.att_W_s(h_seq)
@@ -1096,11 +1109,12 @@ class TAGNN(BaseCalibratedModel):
             hidden_batch = torch.cat(hidden_for_calib, dim=0)
             z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
             return logits, z_US
+
         return logits
 
     def predict_next(self, seq, return_session_rep=False):
-        out = self.forward(seq, return_session_rep=return_session_rep)
-        return out
+        return self.forward(seq, return_session_rep=return_session_rep)
+
 
 
 
@@ -1596,13 +1610,8 @@ def train_model(
                 
                 if model_name.lower() == "duorec":
                     alpha_vec = 0.01 * alpha_vec
-                elif model_name.lower() in ("core", "srgnn", "gcsan", "selfgnn"):
+                elif model_name.lower() in ("core", "srgnn", "gcegnn", "tagnn", "gcsan", "selfgnn"):
                     alpha_vec = 0.5 * alpha_vec
-                elif model_name.lower() == "gcegnn":
-                    alpha_vec = 0.5 * alpha_vec
-                elif model_name.lower() == "tagnn":
-                    alpha_vec = 0.3 * alpha_vec
-                    alpha_vec = torch.clamp(alpha_vec, max=1.0)
                 else:
                     alpha_vec = torch.clamp(alpha_vec, max=1.0)
                 
