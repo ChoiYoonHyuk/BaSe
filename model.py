@@ -572,7 +572,7 @@ class SRT(BaseCalibratedModel):
 
 
 class SRGNN(BaseCalibratedModel):
-    def __init__(self, num_items, d_model=128, dropout=0.2, num_steps=1):
+    def __init__(self, num_items, d_model=128, dropout=0.2, num_steps=3):
         nn.Module.__init__(self)
         BaseCalibratedModel.__init__(self, d_model)
         self.num_items = num_items
@@ -616,6 +616,8 @@ class SRGNN(BaseCalibratedModel):
         dst = inv[1:]
         A_in[dst, src] += 1.0
         A_out[src, dst] += 1.0
+        A_in += torch.eye(n_nodes, device=device) * 0.1
+        A_out += torch.eye(n_nodes, device=device) * 0.1
         row_in = A_in.sum(dim=1, keepdim=True) + 1e-8
         row_out = A_out.sum(dim=1, keepdim=True) + 1e-8
         A_in = A_in / row_in
@@ -630,7 +632,8 @@ class SRGNN(BaseCalibratedModel):
             z = torch.sigmoid(self.W_z(m) + self.U_z(h))
             r = torch.sigmoid(self.W_r(m) + self.U_r(h))
             h_tilde = torch.tanh(self.W_h(m) + self.U_h(r * h))
-            h = (1.0 - z) * h + z * h_tilde
+            h_new = (1.0 - z) * h + z * h_tilde
+            h = self.input_ln(h_new)
         return self.dropout(h)
 
     def forward(self, seq, return_session_rep=False):
