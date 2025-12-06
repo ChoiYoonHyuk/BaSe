@@ -599,6 +599,8 @@ class SRGNN(BaseCalibratedModel):
         self.att_q = nn.Parameter(torch.randn(d_model))
         self.session_proj = nn.Linear(2 * d_model, d_model)
 
+        self.input_ln = nn.LayerNorm(d_model)
+        self.session_ln = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def _build_graph(self, items, device):
@@ -636,6 +638,7 @@ class SRGNN(BaseCalibratedModel):
         B, L = seq.size()
         session_reps = []
         hidden_for_calib = []
+
         for b in range(B):
             s = seq[b]
             items = s[s > 0]
@@ -644,21 +647,32 @@ class SRGNN(BaseCalibratedModel):
                 session_reps.append(h_s)
                 hidden_for_calib.append(h_s.view(1, 1, -1).repeat(1, L, 1))
                 continue
+
             uniq, inv, A_in, A_out = self._build_graph(items, device)
+
             node_emb = self.item_emb(uniq)
+            node_emb = self.input_ln(node_emb)
             h = self._gnn_propagation(node_emb, A_in, A_out)
+
             seq_h = h[inv]
             last_h = seq_h[-1]
+
             att_in = self.att_W_q(seq_h) + self.att_W_k(last_h).unsqueeze(0)
             e = torch.tanh(att_in)
             alpha = torch.softmax(e @ self.att_q, dim=0)
             s_g = (alpha.unsqueeze(-1) * seq_h).sum(dim=0)
+
             s_cat = torch.cat([s_g, last_h], dim=-1)
             s_rep = self.session_proj(s_cat)
+            s_rep = self.session_ln(s_rep)
+            s_rep = self.dropout(s_rep)
+
             session_reps.append(s_rep)
             hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
+
         session_batch = torch.stack(session_reps, dim=0)
         logits = session_batch @ self.item_emb.weight.t()
+
         if return_session_rep:
             hidden_batch = torch.cat(hidden_for_calib, dim=0)
             z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
@@ -666,8 +680,8 @@ class SRGNN(BaseCalibratedModel):
         return logits
 
     def predict_next(self, seq, return_session_rep=False):
-        out = self.forward(seq, return_session_rep=return_session_rep)
-        return out
+        return self.forward(seq, return_session_rep=return_session_rep)
+
 
 
 class GCSAN(BaseCalibratedModel):
@@ -856,9 +870,13 @@ class GCEGNN(BaseCalibratedModel):
         self.local_U_h = nn.Linear(d_model, d_model, bias=False)
 
         self.global_W = nn.Linear(d_model, d_model)
+        self.global_ln = nn.LayerNorm(d_model)
+
         self.global_gate = nn.Linear(2 * d_model, d_model)
         self.session_proj = nn.Linear(2 * d_model, d_model)
 
+        self.input_ln = nn.LayerNorm(d_model)
+        self.session_ln = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def _build_local_graph(self, items, device):
@@ -894,13 +912,15 @@ class GCEGNN(BaseCalibratedModel):
     def _global_episode_gnn(self, h):
         n_nodes = h.size(0)
         if n_nodes <= 1:
-            return h
-        A = torch.ones(n_nodes, n_nodes, device=h.device) - torch.eye(n_nodes, device=h.device)
-        A = A / (A.sum(dim=1, keepdim=True) + 1e-8)
-        z = A @ self.global_W(h)
-        for _ in range(self.num_steps_global - 1):
-            z = A @ self.global_W(z)
-        return self.dropout(z)
+            return self.global_ln(h)
+
+        q = h.mean(dim=0, keepdim=True)           # (1, D)
+        scores = (h @ q.t()).squeeze(-1)          # (N,)
+        alpha = torch.softmax(scores, dim=0)      # (N,)
+        g = alpha.unsqueeze(-1) * self.global_W(h)
+        g = self.global_ln(g)
+        g = self.dropout(g)
+        return g
 
     def forward(self, seq, return_session_rep=False):
         device = seq.device
@@ -916,8 +936,10 @@ class GCEGNN(BaseCalibratedModel):
                 session_reps.append(rep)
                 hidden_for_calib.append(rep.view(1, 1, -1).repeat(1, L, 1))
                 continue
+
             uniq, inv, A_in, A_out = self._build_local_graph(items, device)
             base_emb = self.item_emb(uniq)
+            base_emb = self.input_ln(base_emb)
 
             h_local_nodes = self._local_gnn(base_emb, A_in, A_out)
             h_global_nodes = self._global_episode_gnn(base_emb)
@@ -932,17 +954,22 @@ class GCEGNN(BaseCalibratedModel):
             mask = (s > 0).float()
             last_idx = (mask.sum() - 1).long().clamp(min=0)
             last_h = h_seq[last_idx]
+
             att_scores = torch.matmul(h_seq, last_h)
             alpha = torch.softmax(att_scores, dim=0)
             s_g = (alpha.unsqueeze(-1) * h_seq).sum(dim=0)
 
             s_cat = torch.cat([s_g, last_h], dim=-1)
             s_rep = self.session_proj(s_cat)
+            s_rep = self.session_ln(s_rep)
+            s_rep = self.dropout(s_rep)
+
             session_reps.append(s_rep)
             hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
 
         session_batch = torch.stack(session_reps, dim=0)
         logits = session_batch @ self.item_emb.weight.t()
+
         if return_session_rep:
             hidden_batch = torch.cat(hidden_for_calib, dim=0)
             z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
@@ -952,6 +979,7 @@ class GCEGNN(BaseCalibratedModel):
     def predict_next(self, seq, return_session_rep=False):
         out = self.forward(seq, return_session_rep=return_session_rep)
         return out
+
 
 
 class TAGNN(BaseCalibratedModel):
@@ -987,6 +1015,9 @@ class TAGNN(BaseCalibratedModel):
         self.att_q = nn.Parameter(torch.randn(d_model))
 
         self.session_proj = nn.Linear(2 * d_model, d_model)
+
+        self.input_ln = nn.LayerNorm(d_model)
+        self.session_ln = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def _build_graph(self, items, device):
@@ -1036,6 +1067,8 @@ class TAGNN(BaseCalibratedModel):
 
             uniq, inv, A_in, A_out = self._build_graph(items, device)
             node_emb = self.item_emb(uniq)
+            node_emb = self.input_ln(node_emb)
+
             h_nodes = self._gnn_propagation(node_emb, A_in, A_out)
             h_seq = h_nodes[inv]
 
@@ -1049,12 +1082,15 @@ class TAGNN(BaseCalibratedModel):
 
             s_cat = torch.cat([s_t, h_last], dim=-1)
             s_rep = self.session_proj(s_cat)
+            s_rep = self.session_ln(s_rep)
+            s_rep = self.dropout(s_rep)
 
             session_reps.append(s_rep)
             hidden_for_calib.append(s_rep.view(1, 1, -1).repeat(1, L, 1))
 
         session_batch = torch.stack(session_reps, dim=0)
         logits = session_batch @ self.item_emb.weight.t()
+
         if return_session_rep:
             hidden_batch = torch.cat(hidden_for_calib, dim=0)
             z_US = self.compute_session_rep_from_hidden(seq, hidden_batch)
@@ -1108,6 +1144,9 @@ class SelfGNN(BaseCalibratedModel):
 
         self.fc_out = nn.Linear(d_model, num_items + 1)
 
+        self.emb_ln = nn.LayerNorm(d_model)
+        self.seq_ln = nn.LayerNorm(d_model)
+
     def _build_adj_and_nodes(self, items, device):
         uniq, inverse = torch.unique(items, return_inverse=True)
         n_nodes = uniq.size(0)
@@ -1135,13 +1174,21 @@ class SelfGNN(BaseCalibratedModel):
                 continue
             uniq, A_norm, inv = self._build_adj_and_nodes(items, device)
             e = self.item_emb(uniq)
+            e = self.emb_ln(e)
             for _ in range(self.n_gnn_layers):
                 z = torch.matmul(A_norm, e)
                 z = F.leaky_relu(z)
                 e = z + e
             e = self.gnn_dropout(e)
-            reps.append(e.mean(dim=0))
-        return torch.stack(reps, dim=0)
+
+            last_idx = items.size(0) - 1
+            last_node = inv[last_idx]
+            q = e[last_node]                       # (D,)
+            scores = torch.matmul(e, q)           # (N,)
+            alpha = torch.softmax(scores, dim=0)
+            rep = (alpha.unsqueeze(-1) * e).sum(dim=0)
+            reps.append(rep)
+        return torch.stack(reps, dim=0)           # (B, D)
 
     def _interval_and_instance(self, seq):
         device = seq.device
@@ -1164,9 +1211,11 @@ class SelfGNN(BaseCalibratedModel):
         return e_bar_u, e_tilde_u
 
     def forward(self, seq, return_session_rep=False):
-        short_u = self._short_term_gnn(seq)
+        short_u = self._short_term_gnn(seq)       # (B, D)
         e_bar_u, e_tilde_u = self._interval_and_instance(seq)
+
         e_hat_u = short_u + e_bar_u + e_tilde_u
+        e_hat_u = self.seq_ln(e_hat_u)
 
         logits = torch.matmul(e_hat_u, self.item_emb.weight.t())
 
@@ -1179,6 +1228,7 @@ class SelfGNN(BaseCalibratedModel):
 
     def predict_next(self, seq, return_session_rep=False):
         return self.forward(seq, return_session_rep=return_session_rep)
+
 
 
 def build_model(model_name, num_items, max_len=50, d_model=128, n_heads=2, n_layers=2, dropout=0.2):
