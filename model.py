@@ -1254,7 +1254,7 @@ def build_model(model_name, num_items, max_len=50, d_model=128, n_heads=2, n_lay
     elif model_name == "gcsan":
         return GCSAN(num_items=num_items, max_len=max_len, d_model=d_model,
                      n_heads=n_heads, n_layers=1, dropout=dropout)
-    elif model_name == "gce-gnn" or model_name == "gcegnn":
+    elif model_name == "gcegnn" or model_name == "gcegnn":
         return GCEGNN(num_items=num_items, max_len=max_len, d_model=d_model,
                       dropout=dropout)
     elif model_name == "tagnn":
@@ -1582,10 +1582,13 @@ def train_model(
                     logits = model.predict_next(seq_batch)
                     rep_for_alpha = seq_output
                     logits = 5.0 * logits
-                elif model_name.lower() in ("gcsan", "srgnn", "gce-gnn", "gcegnn", "tagnn", "selfgnn"):
+                elif model_name.lower() in ("srgnn", "gcsan", "tagnn", "selfgnn"):
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
                     logits = 5.0 * logits
+                elif model_name.lower() == "gcegnn":
+                    logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
+                    rep_for_alpha = z_US
                 else:
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
@@ -1596,7 +1599,10 @@ def train_model(
                 
                 if model_name.lower() == "duorec":
                     alpha_vec = 0.01 * alpha_vec
-                elif model_name.lower() in ("core", "gcsan", "srgnn", "gce-gnn", "gcegnn", "tagnn", "selfgnn"):
+                elif model_name.lower() == "gcegnn":
+                    alpha_vec = 0.3 * alpha_vec
+                    alpha_vec = torch.clamp(alpha_vec, max=1.0)
+                elif model_name.lower() in ("core", "srgnn", "gcsan", "tagnn", "selfgnn"):
                     alpha_vec = 0.5 * alpha_vec
                 else:
                     alpha_vec = torch.clamp(alpha_vec, max=1.0)
@@ -1610,7 +1616,9 @@ def train_model(
 
                 iw = w_tilde[tgt_batch]
                 iw = torch.where(tgt_batch > 0, iw, torch.zeros_like(iw))
-                if iw_clip is not None:
+                if model_name.lower() == "gcegnn":
+                    iw = torch.clamp(iw, max=5.0)
+                elif iw_clip is not None:
                     iw = torch.clamp(iw, max=iw_clip)
 
                 loss_iw_ce = - (iw * log_p_y).sum() / (iw.sum() + 1e-8)
@@ -1630,7 +1638,10 @@ def train_model(
                 
                 l_cal = (p_nonpad * (torch.log(p_nonpad) - torch.log(mu_nonpad))).sum()
                 
-                cal_weight = lambda_cal * 0.03
+                if model_name.lower() == "gcegnn":
+                    cal_weight = lambda_cal * 0.01
+                else:
+                    cal_weight = lambda_cal * 0.03
                 
                 l2_reg = torch.tensor(0.0, device=device) 
                 if lambda_l2 > 0.0: 
@@ -1731,7 +1742,7 @@ def parse_args():
         "--model",
         type=str,
         choices=["sasrec", "bert4rec", "duorec", "core", "srt", 
-                 "srgnn", "gcsan", "gce-gnn", "tagnn", "selfgnn"],
+                 "srgnn", "gcsan", "gcegnn", "tagnn", "selfgnn"],
         default="sasrec",
         help="Baseline model",
     )
