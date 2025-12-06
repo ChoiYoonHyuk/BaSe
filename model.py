@@ -1582,17 +1582,10 @@ def train_model(
                     logits = model.predict_next(seq_batch)
                     rep_for_alpha = seq_output
                     logits = 5.0 * logits
-                elif model_name.lower() in ("srgnn", "gcsan", "selfgnn"):
+                elif model_name.lower() == "srgnn":
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
                     logits = 5.0 * logits
-                elif model_name.lower() == "gcegnn":
-                    logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
-                    rep_for_alpha = z_US
-                elif model_name.lower() == "tagnn":
-                    logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
-                    rep_for_alpha = z_US
-                    logits = 1.0 * logits
                 else:
                     logits, z_US = model.predict_next(seq_batch, return_session_rep=True)
                     rep_for_alpha = z_US
